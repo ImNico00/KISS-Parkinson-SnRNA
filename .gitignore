@@ -1,0 +1,5 @@
+.env
+pipeline/run_logs/*
+.vscode
+poetry.lock
+pipeline/src/__pycache__

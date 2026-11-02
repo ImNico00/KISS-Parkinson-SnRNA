@@ -1,0 +1,35 @@
+[project]
+name = "thesis-kiss"
+version = "0.1.0"
+description = "Dependency management for the Thesis KISS Peptine."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+authors = [{ name = "Nico" }]
+dynamic = ["dependencies"]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+pandas = "^3.0.3"
+matplotlib = "^3.11.0"
+seaborn = "^0.13.2"
+numpy = "^2.5.1"
+scanpy = "^1.12.3"
+squidpy = "^1.8.3"
+mygene = "^3.2.2"
+scipy = "^1.18.0"
+anndata = "^0.13.2"
+pydeseq2 = "^0.5.4"
+dnastack-client-library = "^3.1.239"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "*"
+pandas-stubs = "<2.1"
+pytest = "*"
+python-pptx = "^1.0.2"
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
