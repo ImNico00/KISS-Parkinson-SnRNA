@@ -1,3 +1,3 @@
 CANONICAL_NAMES = {
-    "dataset": "dataset.tsv",
+    "dataset_dopaminergic": "dataset_M_Dopa_filtered.h5ad",
 }

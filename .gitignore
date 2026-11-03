@@ -4,3 +4,5 @@ pipeline/run_logs/*
 poetry.lock
 pipeline/src/__pycache__
 pipeline/data/raw/*
+pipeline/data/processed/*.h5ad
+pipeline/reports/*
