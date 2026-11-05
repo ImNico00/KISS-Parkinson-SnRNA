@@ -1,0 +1,6 @@
+step03:
+  dpi_figures: 300
+  min_cells_pseudobulk: 30
+  min_subjects_group: 5
+  fdr_threshold: 0.05
+  logfc_threshold: 0.5

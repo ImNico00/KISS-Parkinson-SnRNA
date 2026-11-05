@@ -1,9 +1,9 @@
 [project]
 name = "thesis-kiss"
 version = "0.1.0"
-description = "Dependency management for the Thesis KISS Peptine."
+description = "Dependency management for the Thesis KISSPeptine."
 readme = "README.md"
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.13,<3.14"
 authors = [{ name = "Nico" }]
 dynamic = ["dependencies"]
 
@@ -11,7 +11,7 @@ dynamic = ["dependencies"]
 package-mode = false
 
 [tool.poetry.dependencies]
-python = ">=3.12,<3.14"
+python = ">=3.13,<3.14"
 pandas = "^3.0.3"
 matplotlib = "^3.11.0"
 seaborn = "^0.13.2"
@@ -23,6 +23,9 @@ scipy = "^1.18.0"
 anndata = "^0.13.4"
 pydeseq2 = "^0.5.4"
 dnastack-client-library = "^3.1.239"
+pertpy = "^1.5.0"
+decoupler = "^2.3.1"
+rpy2 = "^3.6.9"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "*"

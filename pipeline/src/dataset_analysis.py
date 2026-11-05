@@ -20,6 +20,8 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_STEP02_CONFIG: dict[str, Any] = {
     "dpi_figures": 300,
+    "age_bins": [0, 60, 70, 80, 120],
+    "age_labels": ["<60", "60-69", "70-79", "80+"],
 }
 
 
@@ -36,12 +38,18 @@ def _age_stats(series: pd.Series) -> str:
     return f"{mean_age:.1f} ± {std_age:.1f} ({min_age:.0f}-{max_age:.0f})"
 
 
-def show_demographic_summary(adata: ad.AnnData) -> None:
+def _extract_patients_df(adata: ad.AnnData) -> pd.DataFrame:
+    """Estrae una tabella deduplicata a livello di soggetto (ASAP_subject_id)."""
     df_obs = adata.obs[["ASAP_subject_id", "condition_id", "sex", "age"]].copy()
     df_patients = (
         df_obs.groupby("ASAP_subject_id", observed=True).first().reset_index()
     )
     df_patients["age"] = pd.to_numeric(df_patients["age"], errors="coerce")
+    return df_patients
+
+
+def show_demographic_summary(adata: ad.AnnData) -> None:
+    df_patients = _extract_patients_df(adata)
 
     summary = (
         df_patients.groupby(["condition_id", "sex"], observed=True)
@@ -113,6 +121,96 @@ def save_plot_dotplot_kiss1r(
     plt.close()
 
 
+def save_plot_subjects_by_condition_sex(
+    config: dict[str, Any],
+    adata: ad.AnnData,
+    condition_sex_figure_path: Path | str,
+) -> None:
+    """Salva un barplot con la percentuale di soggetti stratificata per condition_id e sex."""
+    df_patients = _extract_patients_df(adata)
+    if df_patients.empty:
+        LOGGER.warning("Nessun soggetto trovato per il plot condition_id vs sex.")
+        return
+
+    # Calcola la percentuale sul totale dei soggetti della coorte
+    ct = (
+        pd.crosstab(
+            df_patients["condition_id"],
+            df_patients["sex"],
+            normalize="all",
+        )
+        * 100.0
+    )
+
+    dpi = int(config["dpi_figures"])
+    fig, ax = plt.subplots(figsize=(8, 6), facecolor="white")
+    ct.plot(kind="bar", ax=ax, rot=0, width=0.7, edgecolor="black")
+
+    ax.set_title("Subjects Distribution by Condition and Sex (%)")
+    ax.set_xlabel("Condition")
+    ax.set_ylabel("Percentage of Total Subjects (%)")
+    ax.legend(title="Sex", frameon=False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.1f%%", padding=3)
+
+    ax.set_ylim(0, max(100.0, ct.to_numpy().max() * 1.15))
+    fig.savefig(condition_sex_figure_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_plot_subjects_by_condition_age(
+    config: dict[str, Any],
+    adata: ad.AnnData,
+    condition_age_figure_path: Path | str,
+) -> None:
+    """Salva un barplot con la percentuale di soggetti stratificata per condition_id e fascia d'età."""
+    df_patients = _extract_patients_df(adata).dropna(subset=["age"])
+    if df_patients.empty:
+        LOGGER.warning("Nessun dato di età valido trovato per il plot condition_id vs age.")
+        return
+
+    bins = config.get("age_bins", DEFAULT_STEP02_CONFIG["age_bins"])
+    labels = config.get("age_labels", DEFAULT_STEP02_CONFIG["age_labels"])
+
+    df_patients["age_group"] = pd.cut(
+        df_patients["age"],
+        bins=bins,
+        labels=labels,
+        right=False,
+    )
+
+    ct = (
+        pd.crosstab(
+            df_patients["condition_id"],
+            df_patients["age_group"],
+            normalize="all",
+            dropna=False,
+        )
+        * 100.0
+    )
+
+    dpi = int(config["dpi_figures"])
+    fig, ax = plt.subplots(figsize=(9, 6), facecolor="white")
+    ct.plot(kind="bar", ax=ax, rot=0, width=0.75, edgecolor="black")
+
+    ax.set_title("Subjects Distribution by Condition and Age Group (%)")
+    ax.set_xlabel("Condition")
+    ax.set_ylabel("Percentage of Total Subjects (%)")
+    ax.legend(title="Age Group", frameon=False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.1f%%", padding=3, fontsize=9)
+
+    ax.set_ylim(0, max(100.0, ct.to_numpy().max() * 1.15))
+    fig.savefig(condition_age_figure_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _resolve_step02_config(config_path: Path) -> dict[str, Any]:
     config = DEFAULT_STEP02_CONFIG.copy()
     if config_path.exists():
@@ -178,6 +276,8 @@ def format_pipeline_step02_summary(
     config_path: str,
     subclusters_figure_path: str,
     kiss1r_dotplot_figure_path: str,
+    condition_sex_figure_path: str,
+    condition_age_figure_path: str,
     output_dir: str,
     report_path: str,
 ) -> None:
@@ -187,6 +287,8 @@ def format_pipeline_step02_summary(
         f"- Config File: {config_path}\n"
         f"- Subclusters Figure: {subclusters_figure_path}\n"
         f"- KISS1R Dotplot Figure: {kiss1r_dotplot_figure_path}\n"
+        f"- Condition/Sex Figure: {condition_sex_figure_path}\n"
+        f"- Condition/Age Figure: {condition_age_figure_path}\n"
         f"- Output Directory: {output_dir}\n"
         f"- Report Path: {report_path}"
     )
@@ -221,6 +323,16 @@ def build_step02_parser(default_repo_root: Path) -> argparse.ArgumentParser:
         default=str(plots_dir / "step02_kiss1r_dotplot.png"),
         help="Path to save the KISS1R dotplot figure.",
     )
+    parser.add_argument(
+        "--condition-sex-figure-path",
+        default=str(plots_dir / "step02_subjects_condition_sex.png"),
+        help="Path to save the subjects percentage by condition and sex figure.",
+    )
+    parser.add_argument(
+        "--condition-age-figure-path",
+        default=str(plots_dir / "step02_subjects_condition_age.png"),
+        help="Path to save the subjects percentage by condition and age figure.",
+    )
     parser.add_argument("--reports-dir", default=str(reports_dir))
     parser.add_argument("--plots-dir", default=str(plots_dir))
     parser.add_argument("--output-dir", default=str(processed_dir))
@@ -243,16 +355,16 @@ def run_step02(args: argparse.Namespace) -> None:
 
     subclusters_figure_path = Path(args.subclusters_figure_path)
     kiss1r_dotplot_figure_path = Path(args.kiss1r_dotplot_figure_path)
+    condition_sex_figure_path = Path(args.condition_sex_figure_path)
+    condition_age_figure_path = Path(args.condition_age_figure_path)
 
     dataset_path = Path(args.dataset_path)
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
-    # Caricamento unico in RAM per supportare viste veloci e plotting Scanpy
     adata = sc.read_h5ad(dataset_path)
     show_demographic_summary(adata)
 
-    # Maschere booleane leggere (nessuna duplicazione della matrice di conteggio)
     mask_male = adata.obs["sex"] == "Male"
     mask_female = adata.obs["sex"] == "Female"
     mask_ctrl = adata.obs["condition_id"] == "Control"
@@ -272,6 +384,16 @@ def run_step02(args: argparse.Namespace) -> None:
         config=config,
         adata=adata,
         kiss1r_dotplot_figure_path=kiss1r_dotplot_figure_path,
+    )
+    save_plot_subjects_by_condition_sex(
+        config=config,
+        adata=adata,
+        condition_sex_figure_path=condition_sex_figure_path,
+    )
+    save_plot_subjects_by_condition_age(
+        config=config,
+        adata=adata,
+        condition_age_figure_path=condition_age_figure_path,
     )
 
     report = {
@@ -312,6 +434,8 @@ def run_step02(args: argparse.Namespace) -> None:
         config_path=str(config_path),
         subclusters_figure_path=str(subclusters_figure_path),
         kiss1r_dotplot_figure_path=str(kiss1r_dotplot_figure_path),
+        condition_sex_figure_path=str(condition_sex_figure_path),
+        condition_age_figure_path=str(condition_age_figure_path),
         output_dir=str(out_dir),
         report_path=str(report_path),
     )
