@@ -33,7 +33,7 @@ COMMAND=(
   "run"
   "${PYTHON_BIN}"
   -m
-  pipeline.src.step02_Analysis
+  pipeline.src.step02_analysis
   "$@"
 )
 

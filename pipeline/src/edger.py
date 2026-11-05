@@ -17,16 +17,18 @@ import scanpy as sc
 import rpy2.robjects as ro
 
 from pipeline.src.schemas import CANONICAL_NAMES
-from pipeline.src.utils import configure_logging, load_yaml_file
+from pipeline.src.utils import build_tagged_path, configure_logging, load_yaml_file
 
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_STEP03_CONFIG: dict[str, Any] = {
     "dpi_figures": 300,
     "min_cells_pseudobulk": 20,
+    "min_counts_pseudobulk": 1000,
     "min_subjects_group": 5,
     "fdr_threshold": 0.05,
-    "logfc_threshold": 0.5,
+    "logfc_threshold": 0.3,
+    "most_significant_dea": 10,
 }
 
 
@@ -82,17 +84,37 @@ def make_pseudobulk(
     adata: ad.AnnData,
     cohort_label: str,
     min_cells: int = 20,
+    min_counts: int = 1000,
+    qc_plot_path: Path | None = None,
+    dpi: int = 300,
 ) -> ad.AnnData:
-    """Generates pseudobulk profiles and filters out low-quality samples with fewer than min_cells."""
+    """Generates pseudobulk profiles, saves QC plot before filtering, and filters low-quality samples."""
     LOGGER.info("Generating pseudobulk for %s (min_cells=%d)...", cohort_label, min_cells)
 
+    # Se i conteggi grezzi sono in un layer, aggiungi layer="counts"
     pdata = dc.pp.pseudobulk(
         adata,
         sample_col="ASAP_subject_id",
         groups_col="HMBA_Group_name",
+        mode="sum",
     )
 
-    dc.pp.filter_samples(pdata, min_cells=min_cells)
+    # Plot QC PRIMA di rimuovere i campioni filtrati
+    if qc_plot_path is not None:
+        try:
+            dc.pl.filter_samples(
+                pdata,
+                groupby=["condition_id", "HMBA_Group_name"],
+                min_cells=min_cells,
+                min_counts=min_counts,
+                dpi=dpi,
+                save=str(qc_plot_path),
+            )
+            plt.close("all")
+        except Exception as exc:
+            LOGGER.warning("Skipped decoupler QC plot for %s: %s", cohort_label, exc)
+
+    dc.pp.filter_samples(pdata, min_cells=min_cells, min_counts=min_counts)
     return pdata
 
 
@@ -151,8 +173,8 @@ def save_plot_volcano(
     ax.axvline(lfc_thresh, color="black", linestyle="--", linewidth=0.8)
     ax.axvline(-lfc_thresh, color="black", linestyle="--", linewidth=0.8)
 
-    # Annotate top 10 most significant DE genes
-    sig_df = df[up_mask | down_mask].sort_values(padj_col, ascending=True).head(10)
+    # Annotate top most significant DE genes
+    sig_df = df[up_mask | down_mask].sort_values(padj_col, ascending=True).head(config["most_significant_dea"])
     for gene_name, row in sig_df.iterrows():
         y_val = -np.log10(max(float(row[padj_col]), np.finfo(float).tiny))
         ax.annotate(
@@ -243,13 +265,23 @@ def run_edger_and_export_rnk(
         pdata_sub = pdata[pdata.obs["HMBA_Group_name"] == cell_type].copy()
 
         # --- METADATA CLEANUP ---
-        # Keep only essential columns for the design matrix and sample checks
         required_cols = ["ASAP_subject_id", "condition_id", "HMBA_Group_name", "age", "sex"]
         pdata_sub.obs = pdata_sub.obs[
             [c for c in required_cols if c in pdata_sub.obs.columns]
         ].copy()
-        # Ensure 'age' is numeric (float) for EdgeR
+
         pdata_sub.obs["age"] = pd.to_numeric(pdata_sub.obs["age"], errors="coerce").astype(float)
+
+        # Rimuovi campioni con NaN in condition_id o age prima di contare i soggetti
+        valid_mask = pdata_sub.obs["condition_id"].notna() & pdata_sub.obs["age"].notna()
+        if "sex" in pdata_sub.obs.columns:
+            valid_mask &= pdata_sub.obs["sex"].notna()
+        pdata_sub = pdata_sub[valid_mask].copy()
+
+        # Pulisci eventuali categorie inutilizzate che bloccano model.matrix in R
+        for col in ["condition_id", "sex", "HMBA_Group_name"]:
+            if col in pdata_sub.obs.columns and isinstance(pdata_sub.obs[col].dtype, pd.CategoricalDtype):
+                pdata_sub.obs[col] = pdata_sub.obs[col].cat.remove_unused_categories()
 
         # 2. Ensure BOTH conditions meet the minimum sample threshold
         counts_per_cond = pdata_sub.obs["condition_id"].value_counts()
@@ -276,21 +308,28 @@ def run_edger_and_export_rnk(
 
         # 3. Filter out lowly expressed genes for this specific cell type
         dc.pp.filter_by_expr(pdata_sub, group="condition_id")
+        if pdata_sub.n_vars == 0:
+            LOGGER.warning("No genes passed filter_by_expr for %s in %s. Skipping...", cell_type, cohort_label)
+            continue
 
-        # 4. Initialize EdgeR (include 'sex' as covariate if multiple sexes are present)
+        # 4. Build design formula dynamically based on non-constant covariates
+        covariates = []
+        if pdata_sub.obs["age"].nunique() > 1:
+            covariates.append("age")
         if "sex" in pdata_sub.obs.columns and pdata_sub.obs["sex"].nunique() > 1:
-            design_formula = "~age + sex + condition_id"
-        else:
-            design_formula = "~age + condition_id"
+            covariates.append("sex")
+        covariates.append("condition_id")
+        design_formula = "~" + " + ".join(covariates)
 
+        # 5. Fit EdgeR model with design_formula and test PD vs Control contrast
         edgr = pt.tl.EdgeR(pdata_sub, design=design_formula)
-
-        # 5. Run differential expression test
-        edger_results = edgr.compare_groups(
-            pdata_sub,
-            column="condition_id",
-            baseline="Control",
-            groups_to_compare=["PD"],
+        edgr.fit()
+        edger_results = edgr.test_contrasts(
+            edgr.contrast(
+                column="condition_id",
+                baseline="Control",
+                group_to_compare="PD",
+            )
         )
 
         # 6. Export CSV table
@@ -392,10 +431,21 @@ def build_step03_parser(default_repo_root: Path) -> argparse.ArgumentParser:
         help="Minimum number of cells per sample in pseudobulk (overrides config).",
     )
     parser.add_argument(
+        "--min-counts",
+        type=int,
+        default=None,
+        help="Minimum number of counts per sample in pseudobulk (overrides config).",
+    )
+    parser.add_argument(
         "--min-subjects-group",
         type=int,
         default=None,
         help="Minimum number of subjects per condition (Control/PD) in EdgeR (overrides config).",
+    )
+    parser.add_argument(
+        "--qc-plot-path",
+        default=str(plots_dir / "step03_pseudobulk_qc.png"),
+        help="Base filename or path for the pseudobulk QC plot (cohort label is appended automatically).",
     )
     parser.add_argument("--reports-dir", default=str(reports_dir))
     parser.add_argument("--plots-dir", default=str(plots_dir))
@@ -413,6 +463,9 @@ def run_step03(args: argparse.Namespace) -> None:
     min_cells = (
         args.min_cells if args.min_cells is not None else int(config["min_cells_pseudobulk"])
     )
+    min_counts = (
+        args.min_counts if args.min_counts is not None else int(config["min_counts_pseudobulk"])
+    )
     min_subjects = (
         args.min_subjects_group
         if args.min_subjects_group is not None
@@ -425,6 +478,8 @@ def run_step03(args: argparse.Namespace) -> None:
     plots_dir.mkdir(parents=True, exist_ok=True)
     reports_dir = Path(args.reports_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
+
+    qc_plot_path = Path(args.qc_plot_path)
 
     dataset_path = Path(args.dataset_path)
     if not dataset_path.exists():
@@ -454,29 +509,24 @@ def run_step03(args: argparse.Namespace) -> None:
         "sex_group": args.sex_group,
         "combined": bool(args.combined),
         "min_cells_pseudobulk": min_cells,
+        "min_counts_pseudobulk": min_counts,
         "min_subjects_group": min_subjects,
+        "fdr_threshold": fdr_thresh,
+        "logfc_threshold": lfc_thresh,
+        "most_significant_dea": int(config["most_significant_dea"]),
         "cohorts": {},
     }
 
     for cohort_label, sub_adata in cohorts_to_run:
+        cohort_qc_plot_path = build_tagged_path(qc_plot_path.name, cohort_label, default_dir=qc_plot_path.parent)
         pdata = make_pseudobulk(
             adata=sub_adata,
             cohort_label=cohort_label,
             min_cells=min_cells,
+            min_counts=min_counts,
+            qc_plot_path=cohort_qc_plot_path,
+            dpi=int(config["dpi_figures"]),
         )
-
-        # Pseudobulk QC plot via decoupler
-        qc_plot_path = plots_dir / f"step03_pseudobulk_qc_{cohort_label}.png"
-        try:
-            dc.pl.filter_samples(
-                pdata,
-                groupby=["condition_id", "HMBA_Group_name"],
-                dpi=int(config["dpi_figures"]),
-                save=str(qc_plot_path),
-            )
-            plt.close("all")
-        except Exception as exc:
-            LOGGER.warning("Skipped decoupler QC plot for %s: %s", cohort_label, exc)
 
         edger_results = run_edger_and_export_rnk(
             pdata=pdata,

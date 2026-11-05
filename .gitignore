@@ -6,3 +6,4 @@ pipeline/src/__pycache__
 pipeline/data/raw/*
 pipeline/data/processed/*
 pipeline/reports/*
+pipeline/plots/*

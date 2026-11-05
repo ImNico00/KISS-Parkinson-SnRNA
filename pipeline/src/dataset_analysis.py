@@ -14,7 +14,7 @@ import scanpy as sc
 from scipy.sparse import issparse
 
 from pipeline.src.schemas import CANONICAL_NAMES
-from pipeline.src.utils import configure_logging, load_yaml_file
+from pipeline.src.utils import build_tagged_path, configure_logging, load_yaml_file
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ def _age_stats(series: pd.Series) -> str:
 
 
 def _extract_patients_df(adata: ad.AnnData) -> pd.DataFrame:
-    """Estrae una tabella deduplicata a livello di soggetto (ASAP_subject_id)."""
+    """Extracts a deduplicated subject-level table based on ASAP_subject_id."""
     df_obs = adata.obs[["ASAP_subject_id", "condition_id", "sex", "age"]].copy()
     df_patients = (
         df_obs.groupby("ASAP_subject_id", observed=True).first().reset_index()
@@ -93,7 +93,7 @@ def save_plot_umap(
         show=False,
     )
     plt.savefig(subclusters_figure_path, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    plt.close("all")
 
 
 def save_plot_dotplot_kiss1r(
@@ -101,11 +101,11 @@ def save_plot_dotplot_kiss1r(
     adata: ad.AnnData,
     kiss1r_dotplot_figure_path: Path | str,
 ) -> None:
-    target_genes = [g for g in ["KISS1", "KISS1R"] if g in adata.var_names]
+    target_genes = [g for g in ["KISS1R"] if g in adata.var_names]
     if not target_genes:
         LOGGER.warning(
-            "Nessuno dei geni %s è presente in adata.var_names. Dotplot saltato.",
-            ["KISS1", "KISS1R"],
+            "None of the target genes %s were found in adata.var_names. Skipping dotplot.",
+            ["KISS1R"],
         )
         return
 
@@ -118,7 +118,47 @@ def save_plot_dotplot_kiss1r(
         show=False,
     )
     plt.savefig(kiss1r_dotplot_figure_path, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    plt.close("all")
+
+
+def save_plot_dotplot_kiss1r_per_group(
+    config: dict[str, Any],
+    adata: ad.AnnData,
+    kiss1r_dotplot_per_group_figure_path: Path | str,
+) -> None:
+    target_genes = [g for g in ["KISS1R"] if g in adata.var_names]
+    if not target_genes:
+        LOGGER.warning(
+            "None of the target genes %s were found in adata.var_names. Skipping per-group dotplot.",
+            ["KISS1R"],
+        )
+        return
+
+    dpi = int(config["dpi_figures"])
+    for sex in adata.obs["sex"].dropna().unique():
+        group_mask = adata.obs["sex"] == sex
+        group_adata = adata[group_mask].copy()
+        if group_adata.n_obs == 0:
+            continue
+
+        if isinstance(group_adata.obs["HMBA_Group_name"].dtype, pd.CategoricalDtype):
+            group_adata.obs["HMBA_Group_name"] = (
+                group_adata.obs["HMBA_Group_name"].cat.remove_unused_categories()
+            )
+
+        group_figure_path = build_tagged_path(
+            kiss1r_dotplot_per_group_figure_path, sex
+        )
+
+        sc.set_figure_params(dpi=dpi // 2, figsize=(8, 8), facecolor="white")
+        sc.pl.dotplot(
+            group_adata,
+            var_names=target_genes,
+            groupby="HMBA_Group_name",
+            show=False,
+        )
+        plt.savefig(group_figure_path, dpi=dpi, bbox_inches="tight")
+        plt.close("all")
 
 
 def save_plot_subjects_by_condition_sex(
@@ -126,13 +166,13 @@ def save_plot_subjects_by_condition_sex(
     adata: ad.AnnData,
     condition_sex_figure_path: Path | str,
 ) -> None:
-    """Salva un barplot con la percentuale di soggetti stratificata per condition_id e sex."""
+    """Saves a barplot showing the percentage of subjects stratified by condition_id and sex."""
     df_patients = _extract_patients_df(adata)
     if df_patients.empty:
-        LOGGER.warning("Nessun soggetto trovato per il plot condition_id vs sex.")
+        LOGGER.warning("No subjects found for the condition_id vs sex plot.")
         return
 
-    # Calcola la percentuale sul totale dei soggetti della coorte
+    # Compute percentage over total cohort subjects
     ct = (
         pd.crosstab(
             df_patients["condition_id"],
@@ -166,10 +206,10 @@ def save_plot_subjects_by_condition_age(
     adata: ad.AnnData,
     condition_age_figure_path: Path | str,
 ) -> None:
-    """Salva un barplot con la percentuale di soggetti stratificata per condition_id e fascia d'età."""
+    """Saves a barplot showing the percentage of subjects stratified by condition_id and age group."""
     df_patients = _extract_patients_df(adata).dropna(subset=["age"])
     if df_patients.empty:
-        LOGGER.warning("Nessun dato di età valido trovato per il plot condition_id vs age.")
+        LOGGER.warning("No valid age data found for the condition_id vs age plot.")
         return
 
     bins = config.get("age_bins", DEFAULT_STEP02_CONFIG["age_bins"])
@@ -220,12 +260,12 @@ def _resolve_step02_config(config_path: Path) -> dict[str, Any]:
             raise ValueError(f"Expected mapping under 'step02' in config: {config_path}")
         config.update({k: v for k, v in step02_cfg.items() if v is not None})
     else:
-        LOGGER.warning("Config file non trovato (%s), uso i valori di default.", config_path)
+        LOGGER.warning("Config file not found (%s), using default values.", config_path)
     return config
 
 
 def compute_subgroup_stats(adata: ad.AnnData, mask: pd.Series) -> dict[str, int | None]:
-    """Calcola le statistiche su una vista di AnnData senza allocare copie in RAM."""
+    """Computes summary statistics on an AnnData view without allocating full copies in RAM."""
     sub = adata[mask]
     if sub.n_obs == 0:
         return {
@@ -239,7 +279,7 @@ def compute_subgroup_stats(adata: ad.AnnData, mask: pd.Series) -> dict[str, int 
 
     ages = pd.to_numeric(sub.obs["age"], errors="coerce").dropna()
     gene_sums = np.asarray(sub.X.sum(axis=0)).ravel()
-    active_genes = int((gene_sums >= 1).sum())
+    active_genes = int((gene_sums > 0).sum())
 
     return {
         "number_of_subjects": int(sub.obs["ASAP_subject_id"].nunique()),
@@ -256,9 +296,9 @@ def compute_gene_pct(
     gene: str,
     mask: pd.Series | None = None,
 ) -> float:
-    """Restituisce la percentuale di cellule con espressione > 0 per il gene specificato."""
+    """Returns the percentage of cells with expression > 0 for the specified gene."""
     if gene not in adata.var_names:
-        LOGGER.warning("Gene '%s' non trovato in adata.var_names.", gene)
+        LOGGER.warning("Gene '%s' not found in adata.var_names.", gene)
         return 0.0
 
     sub_gene = adata[mask, gene] if mask is not None else adata[:, gene]
@@ -276,6 +316,7 @@ def format_pipeline_step02_summary(
     config_path: str,
     subclusters_figure_path: str,
     kiss1r_dotplot_figure_path: str,
+    kiss1r_dotplot_per_group_figure_path: str,
     condition_sex_figure_path: str,
     condition_age_figure_path: str,
     output_dir: str,
@@ -287,6 +328,7 @@ def format_pipeline_step02_summary(
         f"- Config File: {config_path}\n"
         f"- Subclusters Figure: {subclusters_figure_path}\n"
         f"- KISS1R Dotplot Figure: {kiss1r_dotplot_figure_path}\n"
+        f"- KISS1R Dotplot Per Group Base Path: {kiss1r_dotplot_per_group_figure_path}\n"
         f"- Condition/Sex Figure: {condition_sex_figure_path}\n"
         f"- Condition/Age Figure: {condition_age_figure_path}\n"
         f"- Output Directory: {output_dir}\n"
@@ -324,6 +366,11 @@ def build_step02_parser(default_repo_root: Path) -> argparse.ArgumentParser:
         help="Path to save the KISS1R dotplot figure.",
     )
     parser.add_argument(
+        "--kiss1r-dotplot-per-group-figure-path",
+        default=str(plots_dir / "step02_kiss1r_dotplot_per_group.png"),
+        help="Base path to save the KISS1R dotplot figure per group.",
+    )
+    parser.add_argument(
         "--condition-sex-figure-path",
         default=str(plots_dir / "step02_subjects_condition_sex.png"),
         help="Path to save the subjects percentage by condition and sex figure.",
@@ -355,6 +402,7 @@ def run_step02(args: argparse.Namespace) -> None:
 
     subclusters_figure_path = Path(args.subclusters_figure_path)
     kiss1r_dotplot_figure_path = Path(args.kiss1r_dotplot_figure_path)
+    kiss1r_dotplot_per_group_figure_path = Path(args.kiss1r_dotplot_per_group_figure_path)
     condition_sex_figure_path = Path(args.condition_sex_figure_path)
     condition_age_figure_path = Path(args.condition_age_figure_path)
 
@@ -395,11 +443,19 @@ def run_step02(args: argparse.Namespace) -> None:
         adata=adata,
         condition_age_figure_path=condition_age_figure_path,
     )
+    save_plot_dotplot_kiss1r_per_group(
+        config=config,
+        adata=adata,
+        kiss1r_dotplot_per_group_figure_path=kiss1r_dotplot_per_group_figure_path,
+    )
 
     report = {
         "config_path": str(config_path),
         "total_subjects": int(adata.obs["ASAP_subject_id"].nunique()),
         "total_cells": int(adata.n_obs),
+        "total_genes": int(adata.n_vars),
+        "age_labels": config["age_labels"],
+        "age_bins": config["age_bins"],
         "male_subjects": {
             "overall": compute_subgroup_stats(adata, mask_male),
             "controls": compute_subgroup_stats(adata, mask_male_ctrl),
@@ -434,6 +490,7 @@ def run_step02(args: argparse.Namespace) -> None:
         config_path=str(config_path),
         subclusters_figure_path=str(subclusters_figure_path),
         kiss1r_dotplot_figure_path=str(kiss1r_dotplot_figure_path),
+        kiss1r_dotplot_per_group_figure_path=str(kiss1r_dotplot_per_group_figure_path),
         condition_sex_figure_path=str(condition_sex_figure_path),
         condition_age_figure_path=str(condition_age_figure_path),
         output_dir=str(out_dir),
