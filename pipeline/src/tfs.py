@@ -1,36 +1,50 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
 import anndata as ad
 import decoupler as dc
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pertpy as pt
 import scanpy as sc
-import rpy2.robjects as ro
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
 
 from pipeline.src.schemas import CANONICAL_NAMES
-from pipeline.src.utils import build_tagged_path, configure_logging, load_yaml_file
+from pipeline.src.utils import build_tagged_path, configure_logging, load_yaml_file, _extract_1d_expr, _ensure_list
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_STEP04_CONFIG: dict[str, Any] = {
-    "dpi_figures": 300,
-    "min_cells_pseudobulk": 20,
-    "min_counts_pseudobulk": 1000,
-    "min_subjects_group": 5,
-    "fdr_threshold": 0.05,
-    "logfc_threshold": 0.3,
-    "most_significant_dea": 10,
-}
+VALID_COHORTS = (
+    "control_male",
+    "control_female",
+    "pd_male",
+    "pd_female",
+    "male",
+    "female",
+    "all",
+)
 
+DEFAULT_STEP04_CONFIG: dict[str, Any] = {
+    "min_cells_pseudobulk": 20,
+    "target_sum_norm": 10000.0,
+    "stratification_mode": "proxy",  # "proxy" or "kiss1r"
+    "kiss1r_gene": "KISS1R",
+    "gnaq_gene": "GNAQ",
+    "proxy_genes": ["CALB2", "TH", "S100B", "GNRH1"],
+    "min_active_proxies": 3,
+    "dorothea_levels": ["A", "B", "C"],
+    "decoupler_methods": ["ulm", "waggr", "viper", "aucell", "gsea", "gsva", "mlm", "zscore"],
+    "min_combo_size": 3,
+    "tmin_targets": 6,
+    "fdr_threshold": 0.05,
+    "diff_threshold": 0.25,
+}
 
 def _resolve_step04_config(config_path: Path) -> dict[str, Any]:
     config = DEFAULT_STEP04_CONFIG.copy()
@@ -42,362 +56,340 @@ def _resolve_step04_config(config_path: Path) -> dict[str, Any]:
         config.update({k: v for k, v in step04_cfg.items() if v is not None})
     else:
         LOGGER.warning("Config file not found (%s), using default values.", config_path)
+
+    config["proxy_genes"] = [str(g) for g in _ensure_list(config["proxy_genes"])]
+    config["dorothea_levels"] = [str(lvl) for lvl in _ensure_list(config["dorothea_levels"])]
+    config["decoupler_methods"] = [str(m) for m in _ensure_list(config["decoupler_methods"])]
     return config
 
 
-def _sanitize_name(name: str) -> str:
-    """Sanitizes cell type names for safe file system paths."""
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_")
+def _subset_adata_by_cohort(adata: ad.AnnData, cohort_key: str) -> tuple[str, ad.AnnData]:
+    """Filters AnnData according to the requested cohort key."""
+    sex_s = adata.obs["sex"].astype(str)
+    cond_s = adata.obs["condition_id"].astype(str)
+
+    cohort_map: dict[str, tuple[str, pd.Series]] = {
+        "control_male": ("CONTROL_MALES", (sex_s == "Male") & (cond_s == "Control")),
+        "control_female": ("CONTROL_FEMALES", (sex_s == "Female") & (cond_s == "Control")),
+        "pd_male": ("PD_MALES", (sex_s == "Male") & (cond_s == "PD")),
+        "pd_female": ("PD_FEMALES", (sex_s == "Female") & (cond_s == "PD")),
+        "male": ("MALES", sex_s == "Male"),
+        "female": ("FEMALES", sex_s == "Female"),
+    }
+
+    if cohort_key not in cohort_map:
+        raise ValueError(f"Unsupported cohort key '{cohort_key}'.")
+
+    label, mask = cohort_map[cohort_key]
+    return label, adata[mask].copy()
 
 
-def _detect_edger_columns(df: pd.DataFrame) -> tuple[str, str, str]:
-    """Dynamically detects logFC, p-value, and adjusted p-value columns from pertpy/EdgeR output."""
-    lfc_col = next((c for c in ["log_fc", "logFC", "log2FoldChange"] if c in df.columns), None)
-    pval_col = next((c for c in ["p_value", "PValue", "pvalue"] if c in df.columns), None)
-    padj_col = next((c for c in ["adj_p_value", "FDR", "padj"] if c in df.columns), None)
-
-    if not lfc_col or not pval_col:
-        raise KeyError(
-            f"Unable to locate logFC or p-value columns in EdgeR output: {list(df.columns)}"
-        )
-    return lfc_col, pval_col, padj_col or pval_col
-
-
-def prepare_gsea_rnk(edger_results: pd.DataFrame, output_rnk_path: Path) -> None:
-    """Generates and saves a .rnk file for WebGestalt/GSEA ranked by sign(logFC) * -log10(pval)."""
-    lfc_col, pval_col, _ = _detect_edger_columns(edger_results)
-
-    df = edger_results[[lfc_col, pval_col]].copy()
-    df[lfc_col] = pd.to_numeric(df[lfc_col], errors="coerce")
-    df[pval_col] = pd.to_numeric(df[pval_col], errors="coerce")
-    df = df.dropna(subset=[lfc_col, pval_col])
-
-    # Avoid log10(0) by clipping p-values to the smallest positive representable float
-    pvals_clipped = np.clip(df[pval_col].to_numpy(), np.finfo(float).tiny, 1.0)
-    df["score"] = np.sign(df[lfc_col].to_numpy()) * (-np.log10(pvals_clipped))
-
-    df = df.sort_values("score", ascending=False)
-    df[["score"]].to_csv(output_rnk_path, sep="\t", header=False)
-
-
-def make_pseudobulk(
+def make_pseudobulk_stratified(
     adata: ad.AnnData,
     cohort_label: str,
+    config: dict[str, Any],
     min_cells: int = 20,
-    min_counts: int = 1000,
-    qc_plot_path: Path | None = None,
-    dpi: int = 300,
-) -> ad.AnnData:
-    """Generates pseudobulk profiles, saves QC plot before filtering, and filters low-quality samples."""
-    LOGGER.info("Generating pseudobulk for %s (min_cells=%d)...", cohort_label, min_cells)
+    stratification_mode: str = "proxy",
+) -> tuple[ad.AnnData, dict[str, Any]]:
+    """
+    Generates subject-level pseudobulk profiles, filters low-cell samples,
+    and stratifies subjects into 'High' vs 'Low' using either KISS1R + proxies or KISS1R alone.
+    """
+    LOGGER.info(
+        "Generating pseudobulk for %s (min_cells=%d, stratification=%s)...",
+        cohort_label,
+        min_cells,
+        stratification_mode,
+    )
 
-    # Se i conteggi grezzi sono in un layer, aggiungi layer="counts"
+    kiss1r_gene = str(config["kiss1r_gene"])
+    gnaq_gene = str(config["gnaq_gene"])
+    proxy_genes: list[str] = config["proxy_genes"]
+    min_proxies = int(config["min_active_proxies"])
+    target_sum = float(config["target_sum_norm"])
+
+    # Validate required genes in adata.var_names
+    required_genes = [kiss1r_gene]
+    if stratification_mode == "proxy":
+        required_genes.extend([gnaq_gene, *proxy_genes])
+
+    missing_genes = [g for g in required_genes if g not in adata.var_names]
+    if missing_genes:
+        raise KeyError(
+            f"Missing required gene(s) in AnnData for '{stratification_mode}' mode: {missing_genes}"
+        )
+
+    # 1. Subject-level pseudobulk (groups_col=None aggregates all cells per subject)
     pdata = dc.pp.pseudobulk(
         adata,
         sample_col="ASAP_subject_id",
-        groups_col="HMBA_Group_name",
+        groups_col=None,
         mode="sum",
     )
 
-    # Plot QC PRIMA di rimuovere i campioni filtrati
-    if qc_plot_path is not None:
-        try:
-            dc.pl.filter_samples(
-                pdata,
-                groupby=["condition_id", "HMBA_Group_name"],
-                min_cells=min_cells,
-                min_counts=min_counts,
-                dpi=dpi,
-                save=str(qc_plot_path),
-            )
-            plt.close("all")
-        except Exception as exc:
-            LOGGER.warning("Skipped decoupler QC plot for %s: %s", cohort_label, exc)
+    n_samples_before_filter = int(pdata.n_obs)
 
-    dc.pp.filter_samples(pdata, min_cells=min_cells, min_counts=min_counts)
-    return pdata
+    # 2. Keep only pseudobulk samples with at least min_cells
+    dc.pp.filter_samples(pdata, min_cells=min_cells)
+    n_samples_after_filter = int(pdata.n_obs)
 
+    if n_samples_after_filter == 0:
+        LOGGER.warning("No pseudobulk samples passed min_cells=%d for %s.", min_cells, cohort_label)
+        return pdata, {
+            "pseudobulk_samples_prefilter": n_samples_before_filter,
+            "pseudobulk_samples_postfilter": 0,
+            "high_count": 0,
+            "low_count": 0,
+        }
 
-def save_plot_volcano(
-    df_res: pd.DataFrame,
-    cohort_label: str,
-    cell_type: str,
-    output_path: Path,
-    config: dict[str, Any],
-) -> None:
-    """Saves a Volcano plot for the EdgeR differential expression results of a specific cell type."""
-    lfc_col, _, padj_col = _detect_edger_columns(df_res)
-    fdr_thresh = float(config["fdr_threshold"])
-    lfc_thresh = float(config["logfc_threshold"])
-    dpi = int(config["dpi_figures"])
+    # 3. Normalize a copy to evaluate gene expression and run decoupler
+    pdata_norm = pdata.copy()
+    sc.pp.normalize_total(pdata_norm, target_sum=target_sum)
+    sc.pp.log1p(pdata_norm)
 
-    df = df_res[[lfc_col, padj_col]].dropna().copy()
-    if df.empty:
-        return
+    kiss1r_expr = _extract_1d_expr(pdata_norm, kiss1r_gene)
+    kiss1r_pos = kiss1r_expr > 0
 
-    lfc = df[lfc_col].to_numpy(dtype=float)
-    padj = np.clip(df[padj_col].to_numpy(dtype=float), np.finfo(float).tiny, 1.0)
-    neg_log10_padj = -np.log10(padj)
+    strat_stats: dict[str, Any] = {
+        "stratification_mode": stratification_mode,
+        "pseudobulk_samples_prefilter": n_samples_before_filter,
+        "pseudobulk_samples_postfilter": n_samples_after_filter,
+        "kiss1r_positive_samples": int(kiss1r_pos.sum()),
+    }
 
-    up_mask = (padj < fdr_thresh) & (lfc >= lfc_thresh)
-    down_mask = (padj < fdr_thresh) & (lfc <= -lfc_thresh)
-    ns_mask = ~(up_mask | down_mask)
+    if stratification_mode == "proxy":
+        gnaq_expr = _extract_1d_expr(pdata_norm, gnaq_gene)
+        gnaq_pos = gnaq_expr > 0
 
-    fig, ax = plt.subplots(figsize=(8, 6), facecolor="white")
-    ax.scatter(
-        lfc[ns_mask],
-        neg_log10_padj[ns_mask],
-        c="lightgrey",
-        alpha=0.6,
-        s=15,
-        label="NS",
-    )
-    ax.scatter(
-        lfc[down_mask],
-        neg_log10_padj[down_mask],
-        c="#1f77b4",
-        alpha=0.8,
-        s=22,
-        label=f"Down ({down_mask.sum()})",
-    )
-    ax.scatter(
-        lfc[up_mask],
-        neg_log10_padj[up_mask],
-        c="#d62728",
-        alpha=0.8,
-        s=22,
-        label=f"Up ({up_mask.sum()})",
-    )
+        proxy_pos_dict: dict[str, np.ndarray] = {}
+        for pg in proxy_genes:
+            proxy_pos_dict[pg] = _extract_1d_expr(pdata_norm, pg) > 0
 
-    ax.axhline(-np.log10(fdr_thresh), color="black", linestyle="--", linewidth=0.8)
-    ax.axvline(lfc_thresh, color="black", linestyle="--", linewidth=0.8)
-    ax.axvline(-lfc_thresh, color="black", linestyle="--", linewidth=0.8)
-
-    # Annotate top most significant DE genes
-    sig_df = df[up_mask | down_mask].sort_values(padj_col, ascending=True).head(config["most_significant_dea"])
-    for gene_name, row in sig_df.iterrows():
-        y_val = -np.log10(max(float(row[padj_col]), np.finfo(float).tiny))
-        ax.annotate(
-            str(gene_name),
-            (float(row[lfc_col]), y_val),
-            fontsize=8,
-            xytext=(3, 3),
-            textcoords="offset points",
+        proxy_count = np.sum(
+            [pos.astype(int) for pos in proxy_pos_dict.values()],
+            axis=0,
         )
+        is_high = kiss1r_pos | (gnaq_pos & (proxy_count >= min_proxies))
 
-    ax.set_title(f"Volcano Plot: {cell_type} ({cohort_label} - PD vs Control)")
-    ax.set_xlabel("log2 Fold Change")
-    ax.set_ylabel("-log10(FDR)")
-    ax.legend(frameon=False)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+        strat_stats["gnaq_positive_samples"] = int(gnaq_pos.sum())
+        strat_stats["min_active_proxies"] = min_proxies
+        strat_stats["proxy_genes_positive_samples"] = {
+            pg: int(pos.sum()) for pg, pos in proxy_pos_dict.items()
+        }
+        strat_stats[" rescued_by_proxies_samples"] = int(
+            ((~kiss1r_pos) & gnaq_pos & (proxy_count >= min_proxies)).sum()
+        )
+    elif stratification_mode == "kiss1r":
+        is_high = kiss1r_pos
+    else:
+        raise ValueError(f"Invalid stratification_mode: {stratification_mode}")
 
-    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
+    status_labels = np.where(is_high, "High", "Low")
+    pdata.obs["PROXY_status"] = status_labels
+    pdata_norm.obs["PROXY_status"] = status_labels
 
+    strat_stats["high_count"] = int((status_labels == "High").sum())
+    strat_stats["low_count"] = int((status_labels == "Low").sum())
 
-def save_plot_deg_summary(
-    results_by_celltype: dict[str, pd.DataFrame],
-    cohort_label: str,
-    output_path: Path,
-    config: dict[str, Any],
-) -> None:
-    """Saves a summary barplot showing the count of Up- and Down-regulated DE genes per cell type."""
-    if not results_by_celltype:
-        return
-
-    fdr_thresh = float(config["fdr_threshold"])
-    lfc_thresh = float(config["logfc_threshold"])
-    dpi = int(config["dpi_figures"])
-
-    rows = []
-    for cell_type, df in results_by_celltype.items():
-        lfc_col, _, padj_col = _detect_edger_columns(df)
-        up = int(((df[padj_col] < fdr_thresh) & (df[lfc_col] >= lfc_thresh)).sum())
-        down = int(((df[padj_col] < fdr_thresh) & (df[lfc_col] <= -lfc_thresh)).sum())
-        rows.append({"cell_type": cell_type, "Up": up, "Down": down})
-
-    summary_df = pd.DataFrame(rows).set_index("cell_type")
-
-    fig, ax = plt.subplots(figsize=(9, 6), facecolor="white")
-    summary_df.plot(
-        kind="bar",
-        ax=ax,
-        color={"Up": "#d62728", "Down": "#1f77b4"},
-        edgecolor="black",
-        rot=30,
-        width=0.7,
+    LOGGER.info(
+        "%s stratification (%s) -> High: %d | Low: %d (out of %d samples)",
+        cohort_label,
+        stratification_mode,
+        strat_stats["high_count"],
+        strat_stats["low_count"],
+        n_samples_after_filter,
     )
 
-    ax.set_title(
-        f"Differentially Expressed Genes per Cell Type ({cohort_label})\n"
-        f"[FDR < {fdr_thresh}, |log2FC| >= {lfc_thresh}]"
-    )
-    ax.set_xlabel("Cell Type (HMBA_Group_name)")
-    ax.set_ylabel("Number of DE Genes")
-    ax.legend(frameon=False)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    for container in ax.containers:
-        ax.bar_label(container, padding=3)
-
-    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
+    return pdata_norm, strat_stats
 
 
-def run_edger_and_export_rnk(
-    pdata: ad.AnnData,
+def optimize_tf_consensus(
+    pdata_norm: ad.AnnData,
     cohort_label: str,
+    net: pd.DataFrame,
+    combinations: list[tuple[str, ...]],
+    output_csv_base: Path,
     output_dir: Path,
-    plots_dir: Path,
     config: dict[str, Any],
-    min_subjects_group: int = 5,
-) -> dict[str, pd.DataFrame]:
-    """Runs EdgeR across cell types, exporting .csv tables, .rnk GSEA files, and Volcano plots."""
-    cell_types = pdata.obs["HMBA_Group_name"].unique()
-    results_by_celltype: dict[str, pd.DataFrame] = {}
+    stratification_mode: str,
+) -> dict[str, Any]:
+    """
+    Runs decoupler methods on normalized pseudobulk profiles, searches over all method
+    combinations for the consensus maximizing significant differential TFs (High vs Low),
+    and exports the best CARNIVAL measurement table.
+    """
+    methods_all: list[str] = config["decoupler_methods"]
+    tmin_all = int(config["tmin_targets"])
+    fdr_thresh = float(config["fdr_threshold"])
+    diff_thresh = float(config["diff_threshold"])
 
-    for cell_type in cell_types:
-        LOGGER.info("--- Differential Expression Analysis (%s) for: %s ---", cohort_label, cell_type)
+    obs = pdata_norm.obs
+    mask_high = (obs["PROXY_status"] == "High").to_numpy()
+    mask_low = (obs["PROXY_status"] == "Low").to_numpy()
 
-        # 1. Isolate rows for the specific cell type
-        pdata_sub = pdata[pdata.obs["HMBA_Group_name"] == cell_type].copy()
+    n_high = int(mask_high.sum())
+    n_low = int(mask_low.sum())
 
-        # --- METADATA CLEANUP ---
-        required_cols = ["ASAP_subject_id", "condition_id", "HMBA_Group_name", "age", "sex"]
-        pdata_sub.obs = pdata_sub.obs[
-            [c for c in required_cols if c in pdata_sub.obs.columns]
-        ].copy()
-
-        pdata_sub.obs["age"] = pd.to_numeric(pdata_sub.obs["age"], errors="coerce").astype(float)
-
-        # Rimuovi campioni con NaN in condition_id o age prima di contare i soggetti
-        valid_mask = pdata_sub.obs["condition_id"].notna() & pdata_sub.obs["age"].notna()
-        if "sex" in pdata_sub.obs.columns:
-            valid_mask &= pdata_sub.obs["sex"].notna()
-        pdata_sub = pdata_sub[valid_mask].copy()
-
-        # Pulisci eventuali categorie inutilizzate che bloccano model.matrix in R
-        for col in ["condition_id", "sex", "HMBA_Group_name"]:
-            if col in pdata_sub.obs.columns and isinstance(pdata_sub.obs[col].dtype, pd.CategoricalDtype):
-                pdata_sub.obs[col] = pdata_sub.obs[col].cat.remove_unused_categories()
-
-        # 2. Ensure BOTH conditions meet the minimum sample threshold
-        counts_per_cond = pdata_sub.obs["condition_id"].value_counts()
-        count_control = int(counts_per_cond.get("Control", 0))
-        count_pd = int(counts_per_cond.get("PD", 0))
-
-        if count_control < min_subjects_group or count_pd < min_subjects_group:
-            LOGGER.warning(
-                "Insufficient samples for %s in %s (Control: %d, PD: %d, min required: %d). Skipping...",
-                cell_type,
-                cohort_label,
-                count_control,
-                count_pd,
-                min_subjects_group,
-            )
-            continue
-
-        LOGGER.info(
-            "Found %d Control samples and %d PD samples for %s",
-            count_control,
-            count_pd,
-            cell_type,
+    if n_high < 2 or n_low < 2:
+        LOGGER.warning(
+            "Skipping Decoupler optimization for %s: insufficient samples for Welch's t-test "
+            "(High=%d, Low=%d; minimum required is 2 per group).",
+            cohort_label,
+            n_high,
+            n_low,
         )
+        return {
+            "status": "skipped_insufficient_samples",
+            "tested_combinations": 0,
+            "best_combo": None,
+            "best_num_tfs": 0,
+            "output_csv": None,
+            "significant_tfs": {},
+        }
 
-        # 3. Filter out lowly expressed genes for this specific cell type
-        dc.pp.filter_by_expr(pdata_sub, group="condition_id")
-        if pdata_sub.n_vars == 0:
-            LOGGER.warning("No genes passed filter_by_expr for %s in %s. Skipping...", cell_type, cohort_label)
-            continue
+    LOGGER.info("Running dc.mt.decouple for %s with methods=%s...", cohort_label, methods_all)
+    dc.mt.decouple(data=pdata_norm, net=net, methods=methods_all, tmin=tmin_all)
 
-        # 4. Build design formula dynamically based on non-constant covariates
-        covariates = []
-        if pdata_sub.obs["age"].nunique() > 1:
-            covariates.append("age")
-        if "sex" in pdata_sub.obs.columns and pdata_sub.obs["sex"].nunique() > 1:
-            covariates.append("sex")
-        covariates.append("condition_id")
-        design_formula = "~" + " + ".join(covariates)
+    res_all = {key: pdata_norm.obsm[key] for key in pdata_norm.obsm.keys()}
 
-        # 5. Fit EdgeR model with design_formula and test PD vs Control contrast
-        edgr = pt.tl.EdgeR(pdata_sub, design=design_formula)
-        edgr.fit()
-        edger_results = edgr.test_contrasts(
-            edgr.contrast(
-                column="condition_id",
-                baseline="Control",
-                group_to_compare="PD",
-            )
-        )
+    best_num_tfs = 0
+    best_max_abs_diff = 0.0
+    best_combo: str | None = None
+    best_df_carnival: pd.DataFrame | None = None
+    best_tfs_detail: dict[str, dict[str, float]] = {}
+    tested_combos = 0
 
-        # 6. Export CSV table
-        if "variable" in edger_results.columns:
-            edger_results = edger_results.set_index("variable")
-
-        safe_cell_name = _sanitize_name(cell_type)
-        csv_file_path = output_dir / f"edgeR_{cohort_label}_PDvsControl_{safe_cell_name}.csv"
-        edger_results.to_csv(csv_file_path)
-        LOGGER.info("Saved CSV: %s", csv_file_path)
-
-        # 7. Export dynamic .rnk file for GSEA / WebGestalt
-        rnk_file_path = output_dir / f"webgestalt_data_{cohort_label}_{safe_cell_name}.rnk"
-        prepare_gsea_rnk(edger_results, rnk_file_path)
-        LOGGER.info("Saved GSEA .rnk file: %s", rnk_file_path)
-
-        # 8. Save Volcano Plot for this cell type
-        volcano_path = plots_dir / f"step04_volcano_{cohort_label}_{safe_cell_name}.png"
-        save_plot_volcano(
-            df_res=edger_results,
-            cohort_label=cohort_label,
-            cell_type=str(cell_type),
-            output_path=volcano_path,
-            config=config,
-        )
-
-        results_by_celltype[str(cell_type)] = edger_results
-
-    # 9. Save DE Summary Barplot across all analyzed cell types for this cohort
-    deg_summary_path = plots_dir / f"step04_deg_summary_{cohort_label}.png"
-    save_plot_deg_summary(
-        results_by_celltype=results_by_celltype,
-        cohort_label=cohort_label,
-        output_path=deg_summary_path,
-        config=config,
+    out_csv_path = build_tagged_path(
+        output_csv_base,
+        cohort_label,
+        stratification_mode.upper(),
+        default_dir=output_dir,
     )
 
-    return results_by_celltype
+    for combo in combinations:
+        methods_combo = list(combo)
+        combo_name = " + ".join(methods_combo)
+
+        res_combo: dict[str, Any] = {}
+        valid_methods = 0
+        for method in methods_combo:
+            score_key = f"score_{method}"
+            padj_key = f"padj_{method}"
+            if score_key in res_all:
+                res_combo[score_key] = res_all[score_key]
+                valid_methods += 1
+            if padj_key in res_all:
+                res_combo[padj_key] = res_all[padj_key]
+
+        if valid_methods < 2:
+            continue
+
+        try:
+            tf_acts, _ = dc.mt.consensus(res_combo)
+
+            high_acts = tf_acts.iloc[mask_high]
+            low_acts = tf_acts.iloc[mask_low]
+
+            # Mean activity difference (High - Low)
+            diff = high_acts.mean(axis=0) - low_acts.mean(axis=0)
+
+            # Welch's t-test across samples for each TF
+            _, p_vals = stats.ttest_ind(high_acts, low_acts, equal_var=False, axis=0)
+            p_vals = np.nan_to_num(p_vals, nan=1.0)
+
+            # Benjamini-Hochberg FDR correction
+            _, padj, _, _ = multipletests(p_vals, method="fdr_bh")
+            pvals_sig = pd.Series(padj, index=diff.index)
+
+            mask_sig = (pvals_sig < fdr_thresh) & (diff.abs() > diff_thresh)
+            valid_tfs = diff[mask_sig].sort_values(ascending=False)
+
+            tested_combos += 1
+            num_sig = int(len(valid_tfs))
+            current_max_diff = float(diff.abs().max()) if not diff.empty else 0.0
+
+            # Update record if strictly more TFs found (or tie broken by larger max |diff|)
+            if num_sig > best_num_tfs or (
+                num_sig > 0 and num_sig == best_num_tfs and current_max_diff > best_max_abs_diff
+            ):
+                best_num_tfs = num_sig
+                best_max_abs_diff = current_max_diff
+                best_combo = combo_name
+
+                best_df_carnival = pd.DataFrame(
+                    {
+                        "Node": valid_tfs.index,
+                        "Measurement": valid_tfs.values,
+                        "padj": pvals_sig.loc[valid_tfs.index].values,
+                    }
+                )
+
+                # Save 2-column CARNIVAL input CSV immediately
+                best_df_carnival[["Node", "Measurement"]].to_csv(out_csv_path, index=False)
+
+                best_tfs_detail = {
+                    str(tf): {
+                        "delta_activity": round(float( valid_tfs.loc[tf]), 6),
+                        "padj": round(float(pvals_sig.loc[tf]), 6),
+                    }
+                    for tf in valid_tfs.index
+                }
+
+                LOGGER.info(
+                    "[%s] New optimal consensus: %d TFs (Combo: %s, max |diff|=%.3f) -> %s",
+                    cohort_label,
+                    num_sig,
+                    combo_name,
+                    current_max_diff,
+                    out_csv_path,
+                )
+
+        except Exception as exc:
+            LOGGER.warning(
+                "Error evaluating combination [%s] in %s: %s: %s",
+                combo_name,
+                cohort_label,
+                type(exc).__name__,
+                exc,
+            )
+
+    return {
+        "status": "completed",
+        "tested_combinations": tested_combos,
+        "best_combo": best_combo,
+        "best_num_tfs": best_num_tfs,
+        "best_max_abs_diff": round(best_max_abs_diff, 6),
+        "output_csv": str(out_csv_path) if best_num_tfs > 0 else None,
+        "significant_tfs": best_tfs_detail,
+    }
 
 
 def format_pipeline_step04_summary(
     *,
     dataset_path: str,
     config_path: str,
-    sex_group: str,
-    combined: bool,
+    cohorts: list[str],
+    stratification_mode: str,
     output_dir: str,
-    plots_dir: str,
     report_path: str,
 ) -> None:
     LOGGER.info(
-        "Pipeline step04 summary:\n"
+        "Pipeline Step04 summary:\n"
         f"- Dopaminergic Dataset: {dataset_path}\n"
         f"- Config File: {config_path}\n"
-        f"- Sex Group: {sex_group} (combined={combined})\n"
-        f"- Output Directory (CSV & RNK): {output_dir}\n"
-        f"- Plots Directory: {plots_dir}\n"
+        f"- Analyzed Cohorts: {', '.join(cohorts)}\n"
+        f"- Stratification Mode: {stratification_mode}\n"
+        f"- Output Directory: {output_dir}\n"
         f"- Report Path: {report_path}"
     )
 
 
 def build_step04_parser(default_repo_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="step04 Differential Expression Analysis (Pseudobulk + EdgeR)",
+        description="Step04 Pseudobulk KISS1R/Proxy Stratification & Decoupler Consensus TF Activity",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     processed_dir = default_repo_root / "pipeline" / "data" / "processed"
-    plots_dir = default_repo_root / "pipeline" / "plots"
     reports_dir = default_repo_root / "pipeline" / "reports"
 
     parser.add_argument(
@@ -411,51 +403,42 @@ def build_step04_parser(default_repo_root: Path) -> argparse.ArgumentParser:
         help="Path to the dopaminergic dataset file (.h5ad).",
     )
     parser.add_argument(
-        "--sex-group",
-        choices=["male", "female", "both"],
-        default="both",
-        help="Target cohort for DEA: 'male', 'female', or 'both'.",
+        "--cohorts",
+        nargs="+",
+        choices=VALID_COHORTS,
+        default=["pd_male"],
+        help=(
+            "One or more target subgroups to analyze: 'control_male', 'control_female', "
+            "'pd_male', 'pd_female', 'male', 'female', or 'all' to run all six subgroups."
+        ),
     )
     parser.add_argument(
-        "--combined",
-        action="store_true",
+        "--stratification",
+        choices=["proxy", "kiss1r"],
+        default=None,
         help=(
-            "When used with '--sex-group both', runs the analysis on males and females "
-            "pooled together in a single pseudobulk instead of separately."
+            "Stratification strategy for High/Low groups: 'proxy' (KISS1R or GNAQ + proxies) "
+            "or 'kiss1r' (KISS1R expression > 0 only). Overrides config if provided."
         ),
     )
     parser.add_argument(
         "--min-cells",
         type=int,
         default=None,
-        help="Minimum number of cells per sample in pseudobulk (overrides config).",
+        help="Minimum number of cells per subject in pseudobulk (overrides config).",
     )
     parser.add_argument(
-        "--min-counts",
-        type=int,
-        default=None,
-        help="Minimum number of counts per sample in pseudobulk (overrides config).",
+        "--carnival-csv-name",
+        default=CANONICAL_NAMES["transcription_factors_name"],
+        help="Base filename for the exported CARNIVAL TF measurements CSV.",
     )
-    parser.add_argument(
-        "--min-subjects-group",
-        type=int,
-        default=None,
-        help="Minimum number of subjects per condition (Control/PD) in EdgeR (overrides config).",
-    )
-    parser.add_argument(
-        "--qc-plot-path",
-        default=str(plots_dir / "step04_pseudobulk_qc.png"),
-        help="Base filename or path for the pseudobulk QC plot (cohort label is appended automatically).",
-    )
+    parser.add_argument("--output-dir", default=str(processed_dir / "step04_carnival"))
     parser.add_argument("--reports-dir", default=str(reports_dir))
-    parser.add_argument("--plots-dir", default=str(plots_dir))
-    parser.add_argument("--output-dir", default=str(processed_dir / "step04_edger"))
     parser.add_argument("--logging-level", default="INFO")
     return parser
 
 
 def run_step04(args: argparse.Namespace) -> None:
-    ro.r('library(edgeR)')
     configure_logging(args.logging_level)
     config_path = Path(args.config)
     config = _resolve_step04_config(config_path)
@@ -463,23 +446,16 @@ def run_step04(args: argparse.Namespace) -> None:
     min_cells = (
         args.min_cells if args.min_cells is not None else int(config["min_cells_pseudobulk"])
     )
-    min_counts = (
-        args.min_counts if args.min_counts is not None else int(config["min_counts_pseudobulk"])
-    )
-    min_subjects = (
-        args.min_subjects_group
-        if args.min_subjects_group is not None
-        else int(config["min_subjects_group"])
+    stratification_mode = (
+        args.stratification
+        if args.stratification is not None
+        else str(config["stratification_mode"]).lower()
     )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    plots_dir = Path(args.plots_dir)
-    plots_dir.mkdir(parents=True, exist_ok=True)
     reports_dir = Path(args.reports_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
-
-    qc_plot_path = Path(args.qc_plot_path)
 
     dataset_path = Path(args.dataset_path)
     if not dataset_path.exists():
@@ -487,81 +463,98 @@ def run_step04(args: argparse.Namespace) -> None:
 
     adata = sc.read_h5ad(dataset_path)
 
-    # Determine which cohorts to run based on CLI arguments
-    cohorts_to_run: list[tuple[str, ad.AnnData]] = []
-    if args.sex_group == "male":
-        cohorts_to_run.append(("MALES", adata[adata.obs["sex"] == "Male"].copy()))
-    elif args.sex_group == "female":
-        cohorts_to_run.append(("FEMALES", adata[adata.obs["sex"] == "Female"].copy()))
-    elif args.sex_group == "both":
-        if args.combined:
-            cohorts_to_run.append(("ALL", adata.copy()))
+    # Expand 'all' if requested
+    requested_cohorts: list[str] = []
+    for c in args.cohorts:
+        if c == "all":
+            requested_cohorts.extend(
+                ["control_male", "control_female", "pd_male", "pd_female", "male", "female"]
+            )
         else:
-            cohorts_to_run.append(("MALES", adata[adata.obs["sex"] == "Male"].copy()))
-            cohorts_to_run.append(("FEMALES", adata[adata.obs["sex"] == "Female"].copy()))
+            requested_cohorts.append(c)
+    # Deduplicate preserving order
+    requested_cohorts = list(dict.fromkeys(requested_cohorts))
 
-    fdr_thresh = float(config["fdr_threshold"])
-    lfc_thresh = float(config["logfc_threshold"])
+    # Pre-load DoRothEA network and pre-compute method combinations once
+    dorothea_levels: list[str] = config["dorothea_levels"]
+    LOGGER.info("Loading DoRothEA network (levels=%s)...", dorothea_levels)
+    net = dc.op.dorothea(levels=dorothea_levels)
 
-    report_summary: dict[str, Any] = {
+    methods_all: list[str] = config["decoupler_methods"]
+    min_combo_size = int(config["min_combo_size"])
+    combinations: list[tuple[str, ...]] = []
+    for r in range(min_combo_size, len(methods_all) + 1):
+        combinations.extend(itertools.combinations(methods_all, r))
+
+    report: dict[str, Any] = {
         "config_path": str(config_path),
         "dataset_path": str(dataset_path),
-        "sex_group": args.sex_group,
-        "combined": bool(args.combined),
-        "min_cells_pseudobulk": min_cells,
-        "min_counts_pseudobulk": min_counts,
-        "min_subjects_group": min_subjects,
-        "fdr_threshold": fdr_thresh,
-        "logfc_threshold": lfc_thresh,
-        "most_significant_dea": int(config["most_significant_dea"]),
+        "stratification_mode": stratification_mode,
+        "parameters": {
+            "min_cells_pseudobulk": min_cells,
+            "target_sum_norm": float(config["target_sum_norm"]),
+            "kiss1r_gene": config["kiss1r_gene"],
+            "gnaq_gene": config["gnaq_gene"] if stratification_mode == "proxy" else None,
+            "proxy_genes": config["proxy_genes"] if stratification_mode == "proxy" else [],
+            "min_active_proxies": (
+                int(config["min_active_proxies"]) if stratification_mode == "proxy" else None
+            ),
+            "dorothea_levels": dorothea_levels,
+            "decoupler_methods": methods_all,
+            "min_combo_size": min_combo_size,
+            "total_combinations_generated": len(combinations),
+            "tmin_targets": int(config["tmin_targets"]),
+            "fdr_threshold": float(config["fdr_threshold"]),
+            "diff_threshold": float(config["diff_threshold"]),
+        },
         "cohorts": {},
     }
 
-    for cohort_label, sub_adata in cohorts_to_run:
-        cohort_qc_plot_path = build_tagged_path(qc_plot_path.name, cohort_label, default_dir=qc_plot_path.parent)
-        pdata = make_pseudobulk(
+    for cohort_key in requested_cohorts:
+        cohort_label, sub_adata = _subset_adata_by_cohort(adata, cohort_key)
+        LOGGER.info("=== Processing Cohort: %s (cells=%d) ===", cohort_label, sub_adata.n_obs)
+
+        if sub_adata.n_obs == 0:
+            LOGGER.warning("No cells found for cohort %s. Skipping...", cohort_label)
+            report["cohorts"][cohort_label] = {"status": "empty_cohort", "total_cells": 0}
+            continue
+
+        pdata_norm, strat_stats = make_pseudobulk_stratified(
             adata=sub_adata,
             cohort_label=cohort_label,
-            min_cells=min_cells,
-            min_counts=min_counts,
-            qc_plot_path=cohort_qc_plot_path,
-            dpi=int(config["dpi_figures"]),
-        )
-
-        edger_results = run_edger_and_export_rnk(
-            pdata=pdata,
-            cohort_label=cohort_label,
-            output_dir=out_dir,
-            plots_dir=plots_dir,
             config=config,
-            min_subjects_group=min_subjects,
+            min_cells=min_cells,
+            stratification_mode=stratification_mode,
         )
 
-        cohort_stats: dict[str, Any] = {}
-        for cell_type, df_res in edger_results.items():
-            lfc_col, _, padj_col = _detect_edger_columns(df_res)
-            cohort_stats[cell_type] = {
-                "tested_genes": int(df_res.shape[0]),
-                "significant_fdr": int((df_res[padj_col] < fdr_thresh).sum()),
-                "upregulated": int(
-                    ((df_res[padj_col] < fdr_thresh) & (df_res[lfc_col] >= lfc_thresh)).sum()
-                ),
-                "downregulated": int(
-                    ((df_res[padj_col] < fdr_thresh) & (df_res[lfc_col] <= -lfc_thresh)).sum()
-                ),
-            }
-        report_summary["cohorts"][cohort_label] = cohort_stats
+        opt_stats = optimize_tf_consensus(
+            pdata_norm=pdata_norm,
+            cohort_label=cohort_label,
+            net=net,
+            combinations=combinations,
+            output_csv_base=Path(args.carnival_csv_name),
+            output_dir=out_dir,
+            config=config,
+            stratification_mode=stratification_mode,
+        )
+
+        report["cohorts"][cohort_label] = {
+            "cohort_key": cohort_key,
+            "total_cells": int(sub_adata.n_obs),
+            "total_subjects_raw": int(sub_adata.obs["ASAP_subject_id"].nunique()),
+            "stratification": strat_stats,
+            "decoupler_consensus": opt_stats,
+        }
 
     report_path = reports_dir / "step04_report.json"
     with report_path.open("w", encoding="utf-8") as handle:
-        json.dump(report_summary, handle, indent=2)
+        json.dump(report, handle, indent=2)
 
     format_pipeline_step04_summary(
         dataset_path=str(dataset_path),
         config_path=str(config_path),
-        sex_group=args.sex_group,
-        combined=bool(args.combined),
+        cohorts=requested_cohorts,
+        stratification_mode=stratification_mode,
         output_dir=str(out_dir),
-        plots_dir=str(plots_dir),
         report_path=str(report_path),
     )

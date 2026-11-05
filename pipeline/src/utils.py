@@ -5,6 +5,9 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+import numpy as np
+import scipy.sparse as sp
+import anndata as ad
 
 def configure_logging(level: str = "INFO") -> None:
     logging.basicConfig(
@@ -33,6 +36,24 @@ def load_dotenv_file(path: str | Path) -> None:
         value = value.strip().strip("'").strip('"')
         if key and key not in os.environ:
             os.environ[key] = value
+
+def _extract_1d_expr(adata: ad.AnnData, gene: str) -> np.ndarray:
+    """Extracts a flattened 1D numpy array of expression values for a single gene."""
+    x = adata[:, gene].X
+    if sp.issparse(x):
+        return x.toarray().ravel()
+    return np.asarray(x).ravel()
+
+def _ensure_list(val: Any) -> list[Any]:
+    """Converts stringified lists from config into standard Python lists."""
+    if isinstance(val, str):
+        try:
+            parsed = ast.literal_eval(val.strip())
+            if isinstance(parsed, (list, tuple)):
+                return list(parsed)
+        except (ValueError, SyntaxError):
+            return [x.strip() for x in val.split(",") if x.strip()]
+    return list(val)
 
 def build_tagged_path(
     base_path: str | Path,
