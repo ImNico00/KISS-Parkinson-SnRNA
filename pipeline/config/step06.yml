@@ -1,0 +1,9 @@
+step06:
+  dpi_figures: 300
+  inherit_step04_params: true
+  consensus_mode: "step04_best"
+  pathway_database: "progeny"
+  progeny_top_genes: 500
+  min_pathway_carnival_overlap: 1
+  correlation_method: "spearman"
+  top_plot_items: 20
