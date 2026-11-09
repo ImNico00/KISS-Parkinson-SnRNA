@@ -5,9 +5,12 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+import h5py
 import numpy as np
 import scipy.sparse as sp
 import anndata as ad
+import pandas as pd
+import re
 
 def configure_logging(level: str = "INFO") -> None:
     logging.basicConfig(
@@ -16,6 +19,75 @@ def configure_logging(level: str = "INFO") -> None:
         datefmt="%H:%M:%S",
         force=True,
     )
+
+def _normalize_sample_id_index(raw_index: pd.Index) -> pd.Index:
+    """
+    Normalizes raw H5AD sample identifiers to match SAMPLE.csv ASAP_sample_id / sample_id:
+      - Fixes typo 'ASAP_PMBDS_' -> 'ASAP_PMDBS_' (case-insensitive)
+      - Strips replicate suffixes after sample number (e.g. '_s001_Rep1', '_s003_rep1', '_s001_1')
+      - Strips trailing '_Rep1' / '_rep1' on non-ASAP sample IDs
+    """
+    return (
+        raw_index.astype(str)
+        .str.strip()
+        .str.replace(r"(?i)^ASAP_PMBDS_", "ASAP_PMDBS_", regex=True)
+        .str.replace(r"(?i)(_s\d+)_(?:rep\d+|\d+)$", r"\1", regex=True)
+        .str.replace(r"(?i)_(?:rep\d+)$", "", regex=True)
+    )
+
+def match_regions(series: pd.Series, targets: list[str]) -> pd.Series:
+    values = series.fillna("").astype(str).str.strip().str.casefold()
+    mask = pd.Series(False, index=series.index)
+
+    for target in targets:
+        candidates = [
+            target.split(" (")[0],
+            *re.findall(r"\(([^,]+),", target),
+            *re.findall(r"UBERON:\d+", target),
+        ]
+
+        for candidate in candidates:
+            candidate = candidate.strip().casefold()
+            if candidate:
+                mask |= values.str.contains(re.escape(candidate), na=False)
+
+    return mask
+
+def _sanitize_obs_for_h5ad(obs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts mixed object-dtype columns in adata.obs into clean strings or numeric types
+    so h5py/anndata never fails with TypeError during write_h5ad or write_elem.
+    """
+    clean_obs = obs.copy()
+    clean_obs.index = clean_obs.index.astype(str)
+
+    for col in clean_obs.columns:
+        series = clean_obs[col]
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            clean_obs[col] = series.cat.remove_unused_categories()
+        elif series.dtype == object or pd.api.types.is_string_dtype(series.dtype):
+            # Try numeric conversion only if all non-null values are numeric
+            non_null = series.dropna()
+            if not non_null.empty:
+                numeric_try = pd.to_numeric(non_null, errors="coerce")
+                if numeric_try.notna().all():
+                    clean_obs[col] = pd.to_numeric(series, errors="coerce").astype(float)
+                    continue
+            clean_obs[col] = series.where(series.notna(), "").astype(str)
+
+    return clean_obs
+
+def _overwrite_obs_in_h5ad(h5ad_path: Path, obs_df: pd.DataFrame) -> None:
+    """Updates only the /obs table inside an existing .h5ad file without rewriting .X."""
+    from anndata.io import write_elem
+
+    with h5py.File(h5ad_path, "a") as f:
+        write_elem(f, "obs", obs_df)
+
+def _first_non_null(series: pd.Series) -> Any:
+    """Returns the first non-null entry in a Series, or np.nan if all are null."""
+    valid = series.dropna()
+    return valid.iloc[0] if not valid.empty else np.nan
 
 def ensure_parent_dir(path: str | Path) -> Path:
     target = Path(path)

@@ -1,7 +1,7 @@
 step04:
-  min_cells_pseudobulk: 20
+  min_cells_pseudobulk: 30
   target_sum_norm: 10000.0
-  stratification_mode: "proxy"
+  stratification_mode: "kiss1r" # "proxy" or "kiss1r"
   kiss1r_gene: "KISS1R"
   gnaq_gene: "GNAQ"
   proxy_genes: ["CALB2", "TH", "S100B", "GNRH1"]
@@ -9,6 +9,6 @@ step04:
   dorothea_levels: ["A", "B", "C"]
   decoupler_methods: ["ulm", "waggr", "viper", "aucell", "gsea", "gsva", "mlm", "zscore"]
   min_combo_size: 3
-  tmin_targets: 15
+  tmin_targets: 10
   fdr_threshold: 0.05
   diff_threshold: 0.3

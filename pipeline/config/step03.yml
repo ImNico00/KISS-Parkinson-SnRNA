@@ -2,7 +2,7 @@ step03:
   dpi_figures: 300
   min_cells_pseudobulk: 20
   min_counts_pseudobulk: 1000
-  min_subjects_group: 5
+  min_subjects_group: 4
   fdr_threshold: 0.05
   logfc_threshold: 0.3
   most_significant_dea: 10

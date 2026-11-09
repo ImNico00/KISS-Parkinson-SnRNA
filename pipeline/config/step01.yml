@@ -1,0 +1,25 @@
+step01:
+  dpi_figures: 300
+  chunk_size: 50000
+  mapmycells_chunk_size: 5000
+  mapmycells_batch_size: 200000
+  mapmycells_max_gb: 6.0
+  overwrite_full_dataset: False
+  use_all_regions: False
+  target_regions_level_1: ["UBERON:0001891", "UBERON:0002435"]
+  target_regions_level_2: ["UBERON:0002038", "UBERON:0001874"]
+  target_conditions: ["Control", "PD"]
+  hmba_dopaminergic_subclass: "M Dopa"
+  hmba_dopaminergic_groups: ["SN SOX6 Dopa", "SN-VTR CALB1 Dopa", "SN-VTR GAD2 Dopa"]
+  restrict_dopaminergic_to_sn: False,
+  min_bootstrapping_prob: 0.0
+  mapmycells_normalization: "raw"
+  mapmycells_bootstrap_iteration: 100
+  mapmycells_bootstrap_factor: 0.5
+  mapmycells_n_processors: 4
+  compute_umap_full: false
+  compute_umap_dopaminergic: true
+
+
+#target_regions_level_1: ["Midbrain mesencephalon (MB, UBERON:0001891)", "Striatum (STR, UBERON:0002435)"]
+#target_regions_level_2: ["Substantia nigra (SN, UBERON:0002038)", "Putamen (PUT, UBERON:0001874)"]

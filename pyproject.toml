@@ -28,6 +28,7 @@ decoupler = "^2.3.1"
 rpy2 = "^3.6.9"
 omnipath = "^1.0.12"
 corneto = "^1.0.0rc8"
+cell-type-mapper = {git = "https://github.com/AllenInstitute/cell_type_mapper.git"}
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "*"
