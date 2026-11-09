@@ -9,6 +9,6 @@ step04:
   dorothea_levels: ["A", "B", "C"]
   decoupler_methods: ["ulm", "waggr", "viper", "aucell", "gsea", "gsva", "mlm", "zscore"]
   min_combo_size: 3
-  tmin_targets: 10
+  tmin_targets: 15
   fdr_threshold: 0.05
   diff_threshold: 0.3
