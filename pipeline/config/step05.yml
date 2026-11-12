@@ -7,7 +7,7 @@ step05:
   top_tfs: 50
   lambda_reg: 0.001
   solver: "scipy"
-  rel_gap: 0.01
+  rel_gap: 0.005
   solver_verbosity: 0
   active_threshold: 0.00001
   max_workers: 3

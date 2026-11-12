@@ -1,7 +1,7 @@
 [project]
-name = "thesis-kiss"
+name = "investigation-kiss-peptines"
 version = "0.1.0"
-description = "Dependency management for the Thesis KISSPeptine."
+description = "Dependency management for the Bioinformatics Investigation of Kiss-Peptines."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 authors = [{ name = "Nico" }]

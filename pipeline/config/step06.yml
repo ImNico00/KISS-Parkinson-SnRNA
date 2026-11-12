@@ -1,9 +1,23 @@
 step06:
   dpi_figures: 300
-  inherit_step04_params: true
-  consensus_mode: "step04_best"
-  pathway_database: "progeny"
+  cohorts: ["pd_male"]
+  min_cells_pseudobulk: 30
+  target_sum_norm: 10000.0
+  kiss1r_gene: "KISS1R"
+  
+  # Parametri per la stratificazione statistica di KISS1R (Fase 1)
+  max_zero_fraction_for_median: 0.50
+  min_subjects_per_group: 4
+  run_detected_only_subsplit: true
+  
+  # Selezione del pannello PROGENy basata su CARNIVAL KISS1R = +1 (Fase 2 & Fase 4)
   progeny_top_genes: 500
   min_pathway_carnival_overlap: 1
-  correlation_method: "spearman"
-  top_plot_items: 20
+  exclude_kiss1r_from_pathway_overlap: true
+  exclude_kiss1r_from_subnetwork_score: true
+  
+  # Ereditarietà da Step04 e soglie statistiche (Fase 3)
+  inherit_step04_consensus: true
+  fallback_consensus_methods: ["aucell", "gsva", "zscore"]
+  tmin_pathway_targets: 5
+  fdr_threshold: 0.05
