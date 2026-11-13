@@ -1,0 +1,49 @@
+name: kisspeptine
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+
+dependencies:
+  # Core Python & Dependency Management
+  - python>=3.13,<3.14
+  - poetry>=1.9.0
+  - pip
+
+  # R & Bioconductor Backend (required by Step 03 EdgeR via rpy2 / pertpy)
+  - r-base>=4.3
+  - bioconductor-edger
+  - bioconductor-limma
+  - r-statmod
+
+  # Native System Libraries & Compilers (HDF5, rpy2, SciPy/HiGHS, Corneto)
+  - hdf5
+  - openblas
+  - pkg-config
+  - c-compiler
+  - cxx-compiler
+
+  # Python Packages (aligned with pyproject.toml)
+  - pip:
+      - numpy>=2.5.1,<3.0.0
+      - scipy>=1.18.0,<2.0.0
+      - pandas>=3.0.3,<4.0.0
+      - matplotlib>=3.11.0,<4.0.0
+      - seaborn>=0.13.2,<0.14.0
+      - anndata>=0.13.4,<0.14.0
+      - scanpy>=1.12.3,<2.0.0
+      - squidpy>=1.8.3,<2.0.0
+      - pertpy>=1.5.0,<2.0.0
+      - decoupler>=2.3.1,<3.0.0
+      - pydeseq2>=0.5.4,<0.6.0
+      - omnipath>=1.0.12,<2.0.0
+      - corneto>=1.0.0rc8
+      - rpy2>=3.6.9,<4.0.0
+      - mygene>=3.2.2,<4.0.0
+      - dnastack-client-library>=3.1.239,<4.0.0
+      - pyyaml>=6.0
+      - torch
+      - git+https://github.com/AllenInstitute/cell_type_mapper.git
+      - ipykernel
+      - pytest
+      - python-pptx>=1.0.2

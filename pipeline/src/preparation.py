@@ -43,12 +43,12 @@ DEFAULT_STEP01_CONFIG: dict[str, Any] = {
     "overwrite_full_dataset": False,
     "use_all_regions": False,
     "target_regions_level_1": [
-        "Midbrain mesencephalon (MB, UBERON:0001891)",
-        "Striatum (STR, UBERON:0002435)",
+        "UBERON:0001891", # Midbrain mesencephalon (MB, UBERON:0001891)
+        "UBERON:0002435", # Striatum (STR, UBERON:0002435)
     ],
     "target_regions_level_2": [
-        "Substantia nigra (SN, UBERON:0002038)",
-        "Putamen (PUT, UBERON:0001874)",
+        "UBERON:0002038", # Substantia nigra (SN, UBERON:0002038)
+        "UBERON:0001874", # Putamen (PUT, UBERON:0001874)
     ],
     "target_conditions": ["Control", "PD"],
     "hmba_dopaminergic_subclass": "M Dopa",

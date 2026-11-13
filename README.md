@@ -1,4 +1,4 @@
-# Investigation of Kiss-Peptins & KISS1R Causal Signaling Pipeline
+# Investigation of Kisspeptins & KISS1R Causal Signaling Pipeline
 
 Repository containing the implementation of an end-to-end Bioinformatics and Systems Biology pipeline for single-nucleus transcriptomic (`snRNA-seq`) analysis of the **ASAP** (*Aligning Science Across Parkinson's*) cohort and causal reconstruction of **KISS1R**-mediated signaling networks in midbrain dopaminergic neurons.
 
@@ -101,7 +101,7 @@ Filters target brain regions, harmonizes ASAP metadata, runs HMBA cell-type clas
 ```
 *Key flags:*
 - `--run-mapmycells` / `--hmba-mapping-csv <path>`: Run MapMyCells locally or import a precomputed CSV annotation file.
-- `--use-all-regions` / `--regions-level-2`: Retain all brain regions or override target regional filtering (default: *Substantia nigra* and *Putamen*).
+- `--use-all-regions` / `--regions-level-2`: Retain all brain regions or override target regional filtering (default: *Substantia nigra* and *Putamen* using UBERON ontology).
 - `--restrict-dopa-to-sn`: Restrict dopaminergic neuron extraction strictly to *Substantia nigra* nuclei.
 - `--overwrite-full-dataset`: Force re-streaming of `full_dataset.h5ad` even if it already exists on disk.
 
