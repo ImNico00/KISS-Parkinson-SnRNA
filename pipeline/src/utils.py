@@ -165,6 +165,26 @@ def build_tagged_path(
 
     return path.with_name(new_filename)
 
+def _strip_yaml_comment(line: str) -> str:
+    """Removes ‘#’ comments at the end of a line or across an entire line, while preserving ‘#’ characters inside quotation marks."""
+    in_single = False
+    in_double = False
+    escape = False
+    for idx, ch in enumerate(line):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:idx].rstrip()
+    return line.rstrip()
+
 def load_yaml_file(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
@@ -172,23 +192,45 @@ def load_yaml_file(path: str | Path) -> dict[str, Any]:
     root: dict[str, Any] = {}
     stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
 
-    for lineno, raw_line in enumerate(config_path.read_text(encoding="utf-8").splitlines(), start=1):
-        # Pulisce eventuali caratteri NBSP (\u00a0) e spazi indesiderati
-        raw_line = raw_line.replace("\u00a0", " ")
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+    idx = 0
+    total_lines = len(lines)
+
+    while idx < total_lines:
+        lineno = idx + 1
+        raw_line = lines[idx].replace("\u00a0", " ")
+        idx += 1
+
+        # Removes inline comments and skips empty lines or lines containing only comments
+        clean_line = _strip_yaml_comment(raw_line)
+        if not clean_line.strip():
             continue
 
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        indent = len(clean_line) - len(clean_line.lstrip(" "))
         if indent % 2 != 0:
             raise ValueError(f"Invalid indentation in YAML config at {config_path}:{lineno}")
 
-        line = raw_line.strip()
+        line = clean_line.strip()
         if ":" not in line:
             raise ValueError(f"Expected key/value mapping in YAML config at {config_path}:{lineno}")
 
         key, raw_value = line.split(":", 1)
         key = key.strip()
         raw_value = raw_value.strip()
+
+        # Supports lists [...] spanning multiple lines (including internal comments)
+        if raw_value.startswith("[") and raw_value.count("[") > raw_value.count("]"):
+            parts = [raw_value]
+            balance = raw_value.count("[") - raw_value.count("]")
+            while idx < total_lines and balance > 0:
+                sub_raw = lines[idx].replace("\u00a0", " ")
+                idx += 1
+                sub_clean = _strip_yaml_comment(sub_raw).strip()
+                if not sub_clean:
+                    continue
+                balance += sub_clean.count("[") - sub_clean.count("]")
+                parts.append(sub_clean)
+            raw_value = " ".join(parts)
 
         while len(stack) > 1 and indent <= stack[-1][0]:
             stack.pop()
@@ -211,7 +253,7 @@ def load_yaml_file(path: str | Path) -> dict[str, Any]:
                 try:
                     value = float(raw_value)
                 except ValueError:
-                    # Tenta di valutare liste inline (es. [0, 60, 70]) o altri letterali Python
+                    # Attempts to evaluate inline/multiline lists or other Python literals
                     try:
                         value = ast.literal_eval(raw_value)
                     except (ValueError, SyntaxError):
