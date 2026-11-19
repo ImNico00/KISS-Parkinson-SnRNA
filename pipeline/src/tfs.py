@@ -16,7 +16,13 @@ from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
 from pipeline.src.schemas import CANONICAL_NAMES
-from pipeline.src.utils import build_tagged_path, configure_logging, load_yaml_file, _extract_1d_expr, _ensure_list
+from pipeline.src.utils import (
+    _ensure_list,
+    _extract_1d_expr,
+    build_tagged_path,
+    configure_logging,
+    load_yaml_file,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,15 +42,52 @@ DEFAULT_STEP04_CONFIG: dict[str, Any] = {
     "stratification_mode": "proxy",  # "proxy" or "kiss1r"
     "kiss1r_gene": "KISS1R",
     "gnaq_gene": "GNAQ",
-    "proxy_genes": ["CALB2", "TH", "S100B", "GNRH1"],
-    "min_active_proxies": 3,
+    "proxy_genes": [
+        "GNA11",
+        "GRK2",
+        "ARRB1",
+        "ARRB2",
+        "PLCB1",
+        "PLCB2",
+        "PLCB3",
+        "PLCB4",
+        "ITPR1",
+        "ITPR2",
+        "ITPR3",
+        "PRKCA",
+        "PRKCB",
+        "TRPC1",
+        "TRPC3",
+        "TRPC4",
+        "TRPC5",
+        "TRPC6",
+        "TRPC7",
+        "MAPK1",
+        "MAPK3",
+        "MAPK14",
+    ],
+    "min_active_proxies": 20,
+    "stability_proxy_thresholds": [18, 19, 20, 21],
     "dorothea_levels": ["A", "B", "C"],
-    "decoupler_methods": ["ulm", "waggr", "viper", "aucell", "gsea", "gsva", "mlm", "zscore"],
+    "decoupler_methods": [
+        "ulm",
+        "waggr",
+        "viper",
+        "aucell",
+        "gsea",
+        "gsva",
+        "mlm",
+        "zscore",
+    ],
+    "primary_consensus_methods": ["viper", "gsea", "mlm"],
+    "run_stability_audit": True,
     "min_combo_size": 3,
-    "tmin_targets": 6,
-    "fdr_threshold": 0.05,
+    "tmin_targets": 10,
+    "fdr_threshold": 0.10,
+    "nominal_p_threshold": 0.05,
     "diff_threshold": 0.25,
 }
+
 
 def _resolve_step04_config(config_path: Path) -> dict[str, Any]:
     config = DEFAULT_STEP04_CONFIG.copy()
@@ -60,6 +103,16 @@ def _resolve_step04_config(config_path: Path) -> dict[str, Any]:
     config["proxy_genes"] = [str(g) for g in _ensure_list(config["proxy_genes"])]
     config["dorothea_levels"] = [str(lvl) for lvl in _ensure_list(config["dorothea_levels"])]
     config["decoupler_methods"] = [str(m) for m in _ensure_list(config["decoupler_methods"])]
+
+    raw_primary = _ensure_list(config.get("primary_consensus_methods", ["viper", "gsea", "mlm"]))
+    if len(raw_primary) == 1 and str(raw_primary[0]).lower() == "all":
+        config["primary_consensus_methods"] = list(config["decoupler_methods"])
+    else:
+        config["primary_consensus_methods"] = [str(m) for m in raw_primary]
+
+    raw_thresh = _ensure_list(config.get("stability_proxy_thresholds", []))
+    config["stability_proxy_thresholds"] = [int(x) for x in raw_thresh]
+    config["run_stability_audit"] = bool(config.get("run_stability_audit", True))
     return config
 
 
@@ -94,6 +147,7 @@ def make_pseudobulk_stratified(
     """
     Generates subject-level pseudobulk profiles, filters low-cell samples,
     and stratifies subjects into 'High' vs 'Low' using either KISS1R + proxies or KISS1R alone.
+    Also records alternative stratification columns in .obs for cross-configuration stability auditing.
     """
     LOGGER.info(
         "Generating pseudobulk for %s (min_cells=%d, stratification=%s)...",
@@ -110,6 +164,7 @@ def make_pseudobulk_stratified(
 
     # Validate required genes in adata.var_names
     required_genes = [kiss1r_gene]
+    has_proxy_genes_in_var = all(g in adata.var_names for g in [gnaq_gene, *proxy_genes])
     if stratification_mode == "proxy":
         required_genes.extend([gnaq_gene, *proxy_genes])
 
@@ -150,6 +205,9 @@ def make_pseudobulk_stratified(
     kiss1r_expr = _extract_1d_expr(pdata_norm, kiss1r_gene)
     kiss1r_pos = kiss1r_expr > 0
 
+    # Always store pure KISS1R stratification for cross-configuration stability comparison
+    pdata_norm.obs["STRAT_kiss1r_pure"] = np.where(kiss1r_pos, "High", "Low")
+
     strat_stats: dict[str, Any] = {
         "stratification_mode": stratification_mode,
         "pseudobulk_samples_prefilter": n_samples_before_filter,
@@ -157,18 +215,30 @@ def make_pseudobulk_stratified(
         "kiss1r_positive_samples": int(kiss1r_pos.sum()),
     }
 
-    if stratification_mode == "proxy":
+    if has_proxy_genes_in_var:
         gnaq_expr = _extract_1d_expr(pdata_norm, gnaq_gene)
         gnaq_pos = gnaq_expr > 0
 
-        proxy_pos_dict: dict[str, np.ndarray] = {}
-        for pg in proxy_genes:
-            proxy_pos_dict[pg] = _extract_1d_expr(pdata_norm, pg) > 0
-
+        proxy_pos_dict: dict[str, np.ndarray] = {
+            pg: (_extract_1d_expr(pdata_norm, pg) > 0) for pg in proxy_genes
+        }
         proxy_count = np.sum(
             [pos.astype(int) for pos in proxy_pos_dict.values()],
             axis=0,
         )
+
+        # Store alternative proxy thresholds for configuration stability audit
+        audit_thresholds = sorted(
+            set([*config.get("stability_proxy_thresholds", []), min_proxies])
+        )
+        for k_thresh in audit_thresholds:
+            if 1 <= k_thresh <= len(proxy_genes):
+                is_high_k = kiss1r_pos | (gnaq_pos & (proxy_count >= k_thresh))
+                pdata_norm.obs[f"STRAT_proxy_min{k_thresh}"] = np.where(
+                    is_high_k, "High", "Low"
+                )
+
+    if stratification_mode == "proxy":
         is_high = kiss1r_pos | (gnaq_pos & (proxy_count >= min_proxies))
 
         strat_stats["gnaq_positive_samples"] = int(gnaq_pos.sum())
@@ -176,7 +246,7 @@ def make_pseudobulk_stratified(
         strat_stats["proxy_genes_positive_samples"] = {
             pg: int(pos.sum()) for pg, pos in proxy_pos_dict.items()
         }
-        strat_stats[" rescued_by_proxies_samples"] = int(
+        strat_stats["rescued_by_proxies_samples"] = int(
             ((~kiss1r_pos) & gnaq_pos & (proxy_count >= min_proxies)).sum()
         )
     elif stratification_mode == "kiss1r":
@@ -203,7 +273,49 @@ def make_pseudobulk_stratified(
     return pdata_norm, strat_stats
 
 
-def optimize_tf_consensus(
+def _evaluate_tf_matrix(
+    tf_acts: pd.DataFrame,
+    mask_high: np.ndarray,
+    mask_low: np.ndarray,
+) -> pd.DataFrame:
+    """Computes mean difference (High - Low), Welch's t-test p-value, and BH-adjusted p-value."""
+    high_acts = tf_acts.iloc[mask_high]
+    low_acts = tf_acts.iloc[mask_low]
+
+    diff = high_acts.mean(axis=0) - low_acts.mean(axis=0)
+    _, p_vals = stats.ttest_ind(high_acts, low_acts, equal_var=False, axis=0)
+    p_vals = np.nan_to_num(p_vals, nan=1.0)
+    _, padj, _, _ = multipletests(p_vals, method="fdr_bh")
+
+    return pd.DataFrame(
+        {
+            "delta_activity": diff.astype(float),
+            "pval": pd.Series(p_vals, index=diff.index, dtype=float),
+            "padj": pd.Series(padj, index=diff.index, dtype=float),
+        },
+        index=diff.index,
+    )
+
+
+def _extract_method_subset(
+    res_all: dict[str, pd.DataFrame],
+    methods_subset: list[str],
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """Extracts score/padj matrices for the requested decoupler methods."""
+    res_sub: dict[str, pd.DataFrame] = {}
+    valid_methods: list[str] = []
+    for method in methods_subset:
+        score_key = f"score_{method}"
+        padj_key = f"padj_{method}"
+        if score_key in res_all:
+            res_sub[score_key] = res_all[score_key]
+            valid_methods.append(method)
+        if padj_key in res_all:
+            res_sub[padj_key] = res_all[padj_key]
+    return res_sub, valid_methods
+
+
+def evaluate_tf_consensus_and_stability(
     pdata_norm: ad.AnnData,
     cohort_label: str,
     net: pd.DataFrame,
@@ -214,13 +326,20 @@ def optimize_tf_consensus(
     stratification_mode: str,
 ) -> dict[str, Any]:
     """
-    Runs decoupler methods on normalized pseudobulk profiles, searches over all method
-    combinations for the consensus maximizing significant differential TFs (High vs Low),
-    and exports the best CARNIVAL measurement table.
+    1. Evaluates TF differential activity on a pre-specified primary consensus (avoiding post-selection bias).
+    2. Exports the primary consensus TF measurements table for Step 05 (CARNIVAL).
+    3. Audits TF stability across:
+       - Individual decoupler methods
+       - All method combinations (e.g., 219 combinations)
+       - Alternative stratification configurations (pure KISS1R vs proxy thresholds)
+    4. Exports a comprehensive stability table (`TF_Stability_*.csv`) for Step 06.
     """
     methods_all: list[str] = config["decoupler_methods"]
+    primary_methods: list[str] = config["primary_consensus_methods"]
+    run_stability_audit = bool(config.get("run_stability_audit", True))
     tmin_all = int(config["tmin_targets"])
     fdr_thresh = float(config["fdr_threshold"])
+    nom_p_thresh = float(config.get("nominal_p_threshold", 0.05))
     diff_thresh = float(config["diff_threshold"])
 
     obs = pdata_norm.obs
@@ -232,7 +351,7 @@ def optimize_tf_consensus(
 
     if n_high < 2 or n_low < 2:
         LOGGER.warning(
-            "Skipping Decoupler optimization for %s: insufficient samples for Welch's t-test "
+            "Skipping Decoupler evaluation for %s: insufficient samples for Welch's t-test "
             "(High=%d, Low=%d; minimum required is 2 per group).",
             cohort_label,
             n_high,
@@ -240,24 +359,55 @@ def optimize_tf_consensus(
         )
         return {
             "status": "skipped_insufficient_samples",
+            "primary_combo": None,
+            "primary_num_tfs": 0,
             "tested_combinations": 0,
             "best_combo": None,
             "best_num_tfs": 0,
             "output_csv": None,
+            "stability_csv": None,
             "significant_tfs": {},
         }
 
-    LOGGER.info("Running dc.mt.decouple for %s with methods=%s...", cohort_label, methods_all)
-    dc.mt.decouple(data=pdata_norm, net=net, methods=methods_all, tmin=tmin_all)
+    # Ensure all primary methods are included when running decouple
+    methods_to_run = list(dict.fromkeys([*methods_all, *primary_methods]))
+    LOGGER.info("Running dc.mt.decouple for %s with methods=%s...", cohort_label, methods_to_run)
+    dc.mt.decouple(data=pdata_norm, net=net, methods=methods_to_run, tmin=tmin_all)
 
     res_all = {key: pdata_norm.obsm[key] for key in pdata_norm.obsm.keys()}
 
-    best_num_tfs = 0
-    best_max_abs_diff = 0.0
-    best_combo: str | None = None
-    best_df_carnival: pd.DataFrame | None = None
-    best_tfs_detail: dict[str, dict[str, float]] = {}
-    tested_combos = 0
+    # -------------------------------------------------------------------------
+    # 1. PRIMARY PRE-SPECIFIED CONSENSUS INFERENCE (No cherry-picking)
+    # -------------------------------------------------------------------------
+    res_primary, valid_primary = _extract_method_subset(res_all, primary_methods)
+    if not valid_primary:
+        raise RuntimeError(
+            f"None of the requested primary_consensus_methods {primary_methods} produced valid scores."
+        )
+
+    primary_combo_name = " + ".join(valid_primary)
+    if len(valid_primary) == 1:
+        primary_tf_acts = res_all[f"score_{valid_primary[0]}"]
+    else:
+        primary_tf_acts, _ = dc.mt.consensus(res_primary)
+
+    primary_stats_df = _evaluate_tf_matrix(primary_tf_acts, mask_high, mask_low)
+    primary_sig_mask = (primary_stats_df["padj"] < fdr_thresh) & (
+        primary_stats_df["delta_activity"].abs() > diff_thresh
+    )
+    primary_nom_mask = (primary_stats_df["pval"] < nom_p_thresh) & (
+        primary_stats_df["delta_activity"].abs() > diff_thresh
+    )
+
+    primary_valid_df = primary_stats_df.loc[primary_sig_mask].sort_values(
+        by="delta_activity", ascending=False
+    )
+    primary_num_tfs = int(len(primary_valid_df))
+    primary_max_abs_diff = (
+        float(primary_stats_df["delta_activity"].abs().max())
+        if not primary_stats_df.empty
+        else 0.0
+    )
 
     out_csv_path = build_tagged_path(
         output_csv_base,
@@ -265,102 +415,340 @@ def optimize_tf_consensus(
         stratification_mode.upper(),
         default_dir=output_dir,
     )
+    stability_csv_path = build_tagged_path(
+        Path("TF_Stability.csv"),
+        cohort_label,
+        stratification_mode.upper(),
+        default_dir=output_dir,
+    )
 
-    for combo in combinations:
-        methods_combo = list(combo)
-        combo_name = " + ".join(methods_combo)
+    if primary_num_tfs > 0:
+        df_carnival_primary = pd.DataFrame(
+            {
+                "Node": primary_valid_df.index,
+                "Measurement": primary_valid_df["delta_activity"].values,
+            }
+        )
+        df_carnival_primary.to_csv(out_csv_path, index=False)
+        LOGGER.info(
+            "[%s] Primary pre-specified consensus (%s): %d significant TFs (FDR < %.2f, |diff| > %.2f) -> %s",
+            cohort_label,
+            primary_combo_name,
+            primary_num_tfs,
+            fdr_thresh,
+            diff_thresh,
+            out_csv_path,
+        )
+    else:
+        LOGGER.warning(
+            "[%s] Primary pre-specified consensus (%s) yielded 0 TFs at FDR < %.2f and |diff| > %.2f.",
+            cohort_label,
+            primary_combo_name,
+            fdr_thresh,
+            diff_thresh,
+        )
 
-        res_combo: dict[str, Any] = {}
-        valid_methods = 0
-        for method in methods_combo:
-            score_key = f"score_{method}"
-            padj_key = f"padj_{method}"
-            if score_key in res_all:
-                res_combo[score_key] = res_all[score_key]
-                valid_methods += 1
-            if padj_key in res_all:
-                res_combo[padj_key] = res_all[padj_key]
-
-        if valid_methods < 2:
-            continue
-
-        try:
-            tf_acts, _ = dc.mt.consensus(res_combo)
-
-            high_acts = tf_acts.iloc[mask_high]
-            low_acts = tf_acts.iloc[mask_low]
-
-            # Mean activity difference (High - Low)
-            diff = high_acts.mean(axis=0) - low_acts.mean(axis=0)
-
-            # Welch's t-test across samples for each TF
-            _, p_vals = stats.ttest_ind(high_acts, low_acts, equal_var=False, axis=0)
-            p_vals = np.nan_to_num(p_vals, nan=1.0)
-
-            # Benjamini-Hochberg FDR correction
-            _, padj, _, _ = multipletests(p_vals, method="fdr_bh")
-            pvals_sig = pd.Series(padj, index=diff.index)
-
-            mask_sig = (pvals_sig < fdr_thresh) & (diff.abs() > diff_thresh)
-            valid_tfs = diff[mask_sig].sort_values(ascending=False)
-
-            tested_combos += 1
-            num_sig = int(len(valid_tfs))
-            current_max_diff = float(diff.abs().max()) if not diff.empty else 0.0
-
-            # Update record if strictly more TFs found (or tie broken by larger max |diff|)
-            if num_sig > best_num_tfs or (
-                num_sig > 0 and num_sig == best_num_tfs and current_max_diff > best_max_abs_diff
-            ):
-                best_num_tfs = num_sig
-                best_max_abs_diff = current_max_diff
-                best_combo = combo_name
-
-                best_df_carnival = pd.DataFrame(
-                    {
-                        "Node": valid_tfs.index,
-                        "Measurement": valid_tfs.values,
-                        "padj": pvals_sig.loc[valid_tfs.index].values,
-                    }
+    # -------------------------------------------------------------------------
+    # 2. SINGLE-METHOD STABILITY AUDIT
+    # -------------------------------------------------------------------------
+    single_method_stats: dict[str, pd.DataFrame] = {}
+    for method in methods_to_run:
+        score_key = f"score_{method}"
+        if score_key in res_all:
+            try:
+                single_method_stats[method] = _evaluate_tf_matrix(
+                    res_all[score_key], mask_high, mask_low
                 )
-
-                # Save 2-column CARNIVAL input CSV immediately
-                best_df_carnival[["Node", "Measurement"]].to_csv(out_csv_path, index=False)
-
-                best_tfs_detail = {
-                    str(tf): {
-                        "delta_activity": round(float( valid_tfs.loc[tf]), 6),
-                        "padj": round(float(pvals_sig.loc[tf]), 6),
-                    }
-                    for tf in valid_tfs.index
-                }
-
-                LOGGER.info(
-                    "[%s] New optimal consensus: %d TFs (Combo: %s, max |diff|=%.3f) -> %s",
+            except Exception as exc:
+                LOGGER.warning(
+                    "Could not compute single-method stats for %s in %s: %s",
+                    method,
                     cohort_label,
-                    num_sig,
-                    combo_name,
-                    current_max_diff,
-                    out_csv_path,
+                    exc,
                 )
 
-        except Exception as exc:
-            LOGGER.warning(
-                "Error evaluating combination [%s] in %s: %s: %s",
-                combo_name,
-                cohort_label,
-                type(exc).__name__,
-                exc,
+    # -------------------------------------------------------------------------
+    # 3. COMBINATORIAL STABILITY AUDIT (Across all 219 method combinations)
+    # -------------------------------------------------------------------------
+    all_tfs = primary_stats_df.index
+    combo_fdr_pass_count = pd.Series(0, index=all_tfs, dtype=int)
+    combo_nom_pass_count = pd.Series(0, index=all_tfs, dtype=int)
+    combo_padj_records: dict[str, list[float]] = {str(tf): [] for tf in all_tfs}
+    combo_delta_records: dict[str, list[float]] = {str(tf): [] for tf in all_tfs}
+
+    best_num_tfs = 0
+    best_max_abs_diff = 0.0
+    best_combo: str | None = None
+    tested_combos = 0
+
+    if run_stability_audit:
+        LOGGER.info(
+            "Running stability audit across %d method combinations for %s...",
+            len(combinations),
+            cohort_label,
+        )
+        for combo in combinations:
+            res_combo, valid_methods = _extract_method_subset(res_all, list(combo))
+            if len(valid_methods) < 2:
+                continue
+
+            combo_name = " + ".join(valid_methods)
+            try:
+                tf_acts_c, _ = dc.mt.consensus(res_combo)
+                c_stats = _evaluate_tf_matrix(tf_acts_c, mask_high, mask_low)
+
+                fdr_mask = (c_stats["padj"] < fdr_thresh) & (
+                    c_stats["delta_activity"].abs() > diff_thresh
+                )
+                nom_mask = (c_stats["pval"] < nom_p_thresh) & (
+                    c_stats["delta_activity"].abs() > diff_thresh
+                )
+
+                passed_fdr_tfs = c_stats.index[fdr_mask]
+                passed_nom_tfs = c_stats.index[nom_mask]
+
+                combo_fdr_pass_count.loc[passed_fdr_tfs] += 1
+                combo_nom_pass_count.loc[passed_nom_tfs] += 1
+
+                for tf in c_stats.index:
+                    tf_str = str(tf)
+                    if tf_str in combo_padj_records:
+                        combo_padj_records[tf_str].append(float(c_stats.loc[tf, "padj"]))
+                        combo_delta_records[tf_str].append(
+                            float(c_stats.loc[tf, "delta_activity"])
+                        )
+
+                tested_combos += 1
+                num_sig = int(fdr_mask.sum())
+                current_max_diff = (
+                    float(c_stats["delta_activity"].abs().max()) if not c_stats.empty else 0.0
+                )
+
+                if num_sig > best_num_tfs or (
+                    num_sig > 0
+                    and num_sig == best_num_tfs
+                    and current_max_diff > best_max_abs_diff
+                ):
+                    best_num_tfs = num_sig
+                    best_max_abs_diff = current_max_diff
+                    best_combo = combo_name
+
+            except Exception as exc:
+                LOGGER.warning(
+                    "Error evaluating combination [%s] in %s: %s: %s",
+                    combo_name,
+                    cohort_label,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    # -------------------------------------------------------------------------
+    # 4. CROSS-CONFIGURATION STABILITY AUDIT (Pure KISS1R & Proxy Thresholds)
+    # -------------------------------------------------------------------------
+    alt_config_stats: dict[str, pd.DataFrame] = {}
+    strat_cols = [col for col in obs.columns if col.startswith("STRAT_")]
+    for scol in strat_cols:
+        alt_high = (obs[scol] == "High").to_numpy()
+        alt_low = (obs[scol] == "Low").to_numpy()
+        if int(alt_high.sum()) >= 2 and int(alt_low.sum()) >= 2:
+            cfg_name = scol.replace("STRAT_", "")
+            alt_config_stats[cfg_name] = _evaluate_tf_matrix(
+                primary_tf_acts, alt_high, alt_low
             )
+
+    # -------------------------------------------------------------------------
+    # 5. BUILD COMPREHENSIVE STABILITY TABLE FOR STEP 06
+    # -------------------------------------------------------------------------
+    n_combos_denom = max(tested_combos, 1)
+    n_configs_denom = max(len(alt_config_stats), 1)
+    stability_rows: list[dict[str, Any]] = []
+
+    for tf in all_tfs:
+        tf_str = str(tf)
+        p_row = primary_stats_df.loc[tf]
+        primary_delta = float(p_row["delta_activity"])
+        primary_sign = np.sign(primary_delta)
+
+        # Single-method agreement metrics
+        n_single_valid = 0
+        n_same_sign = 0
+        nom_methods: list[str] = []
+        fdr_methods: list[str] = []
+        per_method_cols: dict[str, float] = {}
+
+        for m, m_df in single_method_stats.items():
+            if tf not in m_df.index:
+                continue
+            n_single_valid += 1
+            m_delta = float(m_df.loc[tf, "delta_activity"])
+            m_pval = float(m_df.loc[tf, "pval"])
+            m_padj = float(m_df.loc[tf, "padj"])
+
+            per_method_cols[f"delta_{m}"] = round(m_delta, 6)
+            per_method_cols[f"pval_{m}"] = round(m_pval, 6)
+            per_method_cols[f"padj_{m}"] = round(m_padj, 6)
+
+            if np.sign(m_delta) == primary_sign and primary_sign != 0:
+                n_same_sign += 1
+                if m_pval < nom_p_thresh and abs(m_delta) > diff_thresh:
+                    nom_methods.append(m)
+                if m_padj < fdr_thresh and abs(m_delta) > diff_thresh:
+                    fdr_methods.append(m)
+
+        # Combinatorial stability metrics
+        padj_list = combo_padj_records.get(tf_str, [])
+        delta_list = combo_delta_records.get(tf_str, [])
+        median_padj = float(np.median(padj_list)) if padj_list else float(p_row["padj"])
+        iqr_padj = (
+            float(np.percentile(padj_list, 75) - np.percentile(padj_list, 25))
+            if padj_list
+            else 0.0
+        )
+        min_padj = float(np.min(padj_list)) if padj_list else float(p_row["padj"])
+        median_delta = float(np.median(delta_list)) if delta_list else primary_delta
+
+        # Cross-configuration stability metrics
+        n_cfg_same_sign = 0
+        n_cfg_nom_sig = 0
+        n_cfg_fdr_sig = 0
+        kiss1r_pure_delta = np.nan
+        kiss1r_pure_pval = np.nan
+        kiss1r_pure_padj = np.nan
+
+        for cfg_name, cfg_df in alt_config_stats.items():
+            if tf not in cfg_df.index:
+                continue
+            c_delta = float(cfg_df.loc[tf, "delta_activity"])
+            c_pval = float(cfg_df.loc[tf, "pval"])
+            c_padj = float(cfg_df.loc[tf, "padj"])
+
+            if cfg_name == "kiss1r_pure":
+                kiss1r_pure_delta = round(c_delta, 6)
+                kiss1r_pure_pval = round(c_pval, 6)
+                kiss1r_pure_padj = round(c_padj, 6)
+
+            if np.sign(c_delta) == primary_sign and primary_sign != 0:
+                n_cfg_same_sign += 1
+                if c_pval < nom_p_thresh and abs(c_delta) > diff_thresh:
+                    n_cfg_nom_sig += 1
+                if c_padj < fdr_thresh and abs(c_delta) > diff_thresh:
+                    n_cfg_fdr_sig += 1
+
+        row_dict: dict[str, Any] = {
+            "Node": tf_str,
+            "primary_delta_activity": round(primary_delta, 6),
+            "primary_pval": round(float(p_row["pval"]), 6),
+            "primary_padj": round(float(p_row["padj"]), 6),
+            "primary_significant": bool(primary_sig_mask.loc[tf]),
+            "primary_nominal_significant": bool(primary_nom_mask.loc[tf]),
+            "n_single_methods_tested": n_single_valid,
+            "n_single_methods_same_sign": n_same_sign,
+            "single_method_sign_concordance": round(
+                n_same_sign / max(n_single_valid, 1), 4
+            ),
+            "n_single_methods_nominal_sig": len(nom_methods),
+            "single_methods_nominal_sig": ";".join(nom_methods),
+            "n_single_methods_fdr_sig": len(fdr_methods),
+            "single_methods_fdr_sig": ";".join(fdr_methods),
+            "combo_fdr_pass_count": int(combo_fdr_pass_count.loc[tf]),
+            "combo_fdr_selection_freq": round(
+                float(combo_fdr_pass_count.loc[tf]) / n_combos_denom, 4
+            ),
+            "combo_nominal_pass_count": int(combo_nom_pass_count.loc[tf]),
+            "combo_nominal_selection_freq": round(
+                float(combo_nom_pass_count.loc[tf]) / n_combos_denom, 4
+            ),
+            "combo_median_delta": round(median_delta, 6),
+            "combo_median_padj": round(median_padj, 6),
+            "combo_iqr_padj": round(iqr_padj, 6),
+            "combo_min_padj": round(min_padj, 6),
+            "n_configs_tested": len(alt_config_stats),
+            "config_sign_concordance_freq": round(
+                n_cfg_same_sign / n_configs_denom, 4
+            ),
+            "config_nominal_stability_freq": round(
+                n_cfg_nom_sig / n_configs_denom, 4
+            ),
+            "config_fdr_stability_freq": round(
+                n_cfg_fdr_sig / n_configs_denom, 4
+            ),
+            "kiss1r_pure_delta": kiss1r_pure_delta,
+            "kiss1r_pure_pval": kiss1r_pure_pval,
+            "kiss1r_pure_padj": kiss1r_pure_padj,
+        }
+        row_dict.update(per_method_cols)
+        stability_rows.append(row_dict)
+
+    stability_df = pd.DataFrame(stability_rows).sort_values(
+        by=["primary_significant", "primary_padj", "combo_fdr_selection_freq"],
+        ascending=[False, True, False],
+    )
+    stability_df.to_csv(stability_csv_path, index=False)
+    LOGGER.info(
+        "[%s] Saved TF stability audit table (%d TFs) -> %s",
+        cohort_label,
+        len(stability_df),
+        stability_csv_path,
+    )
+
+    # Detailed dict for significant TFs in the primary consensus
+    stability_indexed = stability_df.set_index("Node")
+    significant_tfs_detail: dict[str, dict[str, Any]] = {}
+    for tf in primary_valid_df.index:
+        tf_str = str(tf)
+        s_row = stability_indexed.loc[tf_str]
+        significant_tfs_detail[tf_str] = {
+            "delta_activity": float(s_row["primary_delta_activity"]),
+            "pval": float(s_row["primary_pval"]),
+            "padj": float(s_row["primary_padj"]),
+            "single_method_sign_concordance": float(
+                s_row["single_method_sign_concordance"]
+            ),
+            "single_methods_nominal_sig": str(s_row["single_methods_nominal_sig"]),
+            "combo_fdr_selection_freq": float(s_row["combo_fdr_selection_freq"]),
+            "combo_nominal_selection_freq": float(s_row["combo_nominal_selection_freq"]),
+            "combo_median_padj": float(s_row["combo_median_padj"]),
+            "config_sign_concordance_freq": float(s_row["config_sign_concordance_freq"]),
+            "config_nominal_stability_freq": float(s_row["config_nominal_stability_freq"]),
+            "kiss1r_pure_delta": (
+                None
+                if pd.isna(s_row["kiss1r_pure_delta"])
+                else float(s_row["kiss1r_pure_delta"])
+            ),
+            "kiss1r_pure_pval": (
+                None
+                if pd.isna(s_row["kiss1r_pure_pval"])
+                else float(s_row["kiss1r_pure_pval"])
+            ),
+        }
+
+    # Also summarize top stable TFs across combinations/methods even if they missed strict primary FDR
+    top_stable_candidates = (
+        stability_df.sort_values(
+            by=["combo_fdr_selection_freq", "combo_nominal_selection_freq", "primary_pval"],
+            ascending=[False, False, True],
+        )
+        .head(15)["Node"]
+        .tolist()
+    )
 
     return {
         "status": "completed",
+        "primary_combo": primary_combo_name,
+        "primary_num_tfs": primary_num_tfs,
+        "primary_max_abs_diff": round(primary_max_abs_diff, 6),
         "tested_combinations": tested_combos,
-        "best_combo": best_combo,
-        "best_num_tfs": best_num_tfs,
-        "best_max_abs_diff": round(best_max_abs_diff, 6),
-        "output_csv": str(out_csv_path) if best_num_tfs > 0 else None,
-        "significant_tfs": best_tfs_detail,
+        "exploratory_best_combo": best_combo,
+        "exploratory_best_num_tfs": best_num_tfs,
+        "exploratory_best_max_abs_diff": round(best_max_abs_diff, 6),
+        # Backward-compatible keys pointing to the pre-specified primary consensus
+        "best_combo": primary_combo_name,
+        "best_num_tfs": primary_num_tfs,
+        "best_max_abs_diff": round(primary_max_abs_diff, 6),
+        "output_csv": str(out_csv_path) if primary_num_tfs > 0 else None,
+        "stability_csv": str(stability_csv_path),
+        "significant_tfs": significant_tfs_detail,
+        "top_stable_tfs_across_audit": top_stable_candidates,
     }
 
 
@@ -370,6 +758,7 @@ def format_pipeline_step04_summary(
     config_path: str,
     cohorts: list[str],
     stratification_mode: str,
+    primary_methods: list[str],
     output_dir: str,
     report_path: str,
 ) -> None:
@@ -379,6 +768,7 @@ def format_pipeline_step04_summary(
         f"- Config File: {config_path}\n"
         f"- Analyzed Cohorts: {', '.join(cohorts)}\n"
         f"- Stratification Mode: {stratification_mode}\n"
+        f"- Pre-specified Primary Consensus: {' + '.join(primary_methods)}\n"
         f"- Output Directory: {output_dir}\n"
         f"- Report Path: {report_path}"
     )
@@ -386,7 +776,7 @@ def format_pipeline_step04_summary(
 
 def build_step04_parser(default_repo_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Step04 Pseudobulk KISS1R/Proxy Stratification & Decoupler Consensus TF Activity",
+        description="Step04 Pseudobulk KISS1R/Proxy Stratification & Pre-specified Decoupler Consensus with Stability Audit",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     processed_dir = default_repo_root / "pipeline" / "data" / "processed"
@@ -472,7 +862,6 @@ def run_step04(args: argparse.Namespace) -> None:
             )
         else:
             requested_cohorts.append(c)
-    # Deduplicate preserving order
     requested_cohorts = list(dict.fromkeys(requested_cohorts))
 
     # Pre-load DoRothEA network and pre-compute method combinations once
@@ -481,6 +870,7 @@ def run_step04(args: argparse.Namespace) -> None:
     net = dc.op.dorothea(levels=dorothea_levels)
 
     methods_all: list[str] = config["decoupler_methods"]
+    primary_methods: list[str] = config["primary_consensus_methods"]
     min_combo_size = int(config["min_combo_size"])
     combinations: list[tuple[str, ...]] = []
     for r in range(min_combo_size, len(methods_all) + 1):
@@ -499,12 +889,16 @@ def run_step04(args: argparse.Namespace) -> None:
             "min_active_proxies": (
                 int(config["min_active_proxies"]) if stratification_mode == "proxy" else None
             ),
+            "stability_proxy_thresholds": config["stability_proxy_thresholds"],
             "dorothea_levels": dorothea_levels,
+            "primary_consensus_methods": primary_methods,
             "decoupler_methods": methods_all,
+            "run_stability_audit": bool(config["run_stability_audit"]),
             "min_combo_size": min_combo_size,
-            "total_combinations_generated": len(combinations),
+            "total_combinations_audited": len(combinations),
             "tmin_targets": int(config["tmin_targets"]),
             "fdr_threshold": float(config["fdr_threshold"]),
+            "nominal_p_threshold": float(config["nominal_p_threshold"]),
             "diff_threshold": float(config["diff_threshold"]),
         },
         "cohorts": {},
@@ -527,7 +921,7 @@ def run_step04(args: argparse.Namespace) -> None:
             stratification_mode=stratification_mode,
         )
 
-        opt_stats = optimize_tf_consensus(
+        consensus_stats = evaluate_tf_consensus_and_stability(
             pdata_norm=pdata_norm,
             cohort_label=cohort_label,
             net=net,
@@ -543,7 +937,7 @@ def run_step04(args: argparse.Namespace) -> None:
             "total_cells": int(sub_adata.n_obs),
             "total_subjects_raw": int(sub_adata.obs["ASAP_subject_id"].nunique()),
             "stratification": strat_stats,
-            "decoupler_consensus": opt_stats,
+            "decoupler_consensus": consensus_stats,
         }
 
     report_path = reports_dir / "step04_report.json"
@@ -555,6 +949,7 @@ def run_step04(args: argparse.Namespace) -> None:
         config_path=str(config_path),
         cohorts=requested_cohorts,
         stratification_mode=stratification_mode,
+        primary_methods=primary_methods,
         output_dir=str(out_dir),
         report_path=str(report_path),
     )

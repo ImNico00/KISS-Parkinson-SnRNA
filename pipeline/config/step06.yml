@@ -1,23 +1,125 @@
 step06:
-  dpi_figures: 300
-  cohorts: ["pd_male"]
-  min_cells_pseudobulk: 30
+  # Pseudobulk stratification parameters (aligned with Step 04: 8 High vs 8 Low)
+  min_cells_pseudobulk: 20
   target_sum_norm: 10000.0
+  stratification_mode: "proxy"
   kiss1r_gene: "KISS1R"
-  
-  # Parametri per la stratificazione statistica di KISS1R (Fase 1)
-  max_zero_fraction_for_median: 0.50
-  min_subjects_per_group: 4
-  run_detected_only_subsplit: true
-  
-  # Selezione del pannello PROGENy basata su CARNIVAL KISS1R = +1 (Fase 2 & Fase 4)
+  gnaq_gene: "GNAQ"
+  proxy_genes: [
+    # Gq/11 coupling, receptor kinase, and beta-arrestins (Pampillo 2009; Szereszewski 2010; Babwah 2015)
+    "GNA11", "GRK2", "ARRB1", "ARRB2",
+    # Phospholipase C-beta and ER IP3 receptors (Liu et al. 2008; Kotani et al. 2001)
+    "PLCB1", "PLCB2", "PLCB3", "PLCB4",
+    "ITPR1", "ITPR2", "ITPR3",
+    # Classical Protein Kinase C (Liu et al. 2008)
+    "PRKCA", "PRKCB",
+    # TRPC channels co-expressed in scRT-PCR in KISS1R+ neurons (Zhang et al. 2008)
+    "TRPC1", "TRPC3", "TRPC4", "TRPC5", "TRPC6", "TRPC7",
+    # Downstream Gq/PKC and beta-arrestin MAPK effectors (Kotani 2001; Pampillo 2009; Szereszewski 2010)
+    "MAPK1", "MAPK3", "MAPK14"
+  ]
+  min_active_proxies: 20
+
+  # Gene-set databases for Step 1 (ORA) and PROGENy
+  # Supported options: "kegg", "reactome", "hallmark", "wikipathways", "biocarta", "pid", "go_bp", "progeny"
+  ora_databases: ["kegg", "reactome"]
+  pathway_gene_sets: "msigdb_kegg_reactome_and_progeny"
+  include_kegg_medicus_reference: true
+  exclude_kegg_medicus_pathogens_variants: true
+  include_explicit_attributed_from_msigdb: true
   progeny_top_genes: 500
-  min_pathway_carnival_overlap: 1
-  exclude_kiss1r_from_pathway_overlap: true
-  exclude_kiss1r_from_subnetwork_score: true
-  
-  # Ereditarietà da Step04 e soglie statistiche (Fase 3)
-  inherit_step04_consensus: true
-  fallback_consensus_methods: ["aucell", "gsva", "zscore"]
-  tmin_pathway_targets: 5
+
+  # Permutations for PROGENy Eq. 1 and Step 2 EA tests (Liu et al. 2019)
+  progeny_permutations: 10000
+  step2_permutations: 10000
+
+  # Stimulus-attributed pathway selection mode (set both flags to false and list to [] for database-only ORA)
+  use_default_attributed_pathways: true
+  use_attributed_keywords: true
+  attributed_pathway_keywords: [
+    "KISS1", "GNRH", "PLCB_PKC", "G_ALPHA_Q", "PLC_BETA", "DAG_AND_IP3",
+    "CALCIUM_SIGNALING", "CA2_PATHWAY", "PHOSPHATIDYLINOSITOL_SIGNALING",
+    "MAPK_SIGNALING", "MAPK_FAMILY", "FOCAL_ADHESION", "NEUROTROPHIN_SIGNALING",
+    "SIGNALING_BY_NTRKS", "LONG_TERM_POTENTIATION", "AUTOPHAGY", "MITOPHAGY"
+  ]
+
+  # Explicit KISS1R-attributed pathways (KEGG, KEGG MEDICUS Reference, Reactome, and PROGENy)
+  attributed_pathways: [
+    # --- Original KEGG pathways ---
+    "KEGG_GNRH_SIGNALING_PATHWAY",
+    "KEGG_MEDICUS_REFERENCE_KISS1_KISS1R_PLCB_PKC_SIGNALING_PATHWAY",
+    "KEGG_MEDICUS_REFERENCE_GNRH_GNRHR_PLCB_PKC_SIGNALING_PATHWAY",
+    "KEGG_CALCIUM_SIGNALING_PATHWAY",
+    "KEGG_MAPK_SIGNALING_PATHWAY",
+    "KEGG_PHOSPHATIDYLINOSITOL_SIGNALING_SYSTEM",
+    "KEGG_NEUROTROPHIN_SIGNALING_PATHWAY",
+    "KEGG_ERBB_SIGNALING_PATHWAY",
+    "KEGG_WNT_SIGNALING_PATHWAY",
+    "KEGG_TGF_BETA_SIGNALING_PATHWAY",
+    "KEGG_FOCAL_ADHESION",
+    "KEGG_VEGF_SIGNALING_PATHWAY",
+    "KEGG_LONG_TERM_POTENTIATION",
+    "KEGG_VASCULAR_SMOOTH_MUSCLE_CONTRACTION",
+    "KEGG_PARKINSONS_DISEASE",
+
+    # --- Additional KEGG pathways (Autophagy, Dopamine, Oxidative Stress & Key Hubs) ---
+    "KEGG_REGULATION_OF_AUTOPHAGY",
+    "KEGG_MEDICUS_REFERENCE_PINK_PARKIN_MEDIATED_AUTOPHAGOSOME_FORMATION",
+    "KEGG_MEDICUS_REFERENCE_AUTOPHAGY_VESICLE_NUCLEATION_ELONGATION_MATURATION_MTORC1_PI3KC3_C1",
+    "KEGG_MEDICUS_REFERENCE_AUTOPHAGY_VESICLE_NUCLEATION_ELONGATION_MATURATION_LC3_II_FORMATION",
+    "KEGG_MEDICUS_REFERENCE_DRD1_GNAS_AC_PKA_SIGNALING_PATHWAY",
+    "KEGG_MEDICUS_REFERENCE_CHRNA7_E2F_SIGNALING_PATHWAY",
+    "KEGG_MEDICUS_REFERENCE_PRNP_PI3K_NOX2_SIGNALING_PATHWAY",
+    "KEGG_MEDICUS_REFERENCE_ITGA_B_FAK_RAC_SIGNALING_PATHWAY",
+    "KEGG_ENDOCYTOSIS",
+    "KEGG_UBIQUITIN_MEDIATED_PROTEOLYSIS",
+    "KEGG_AXON_GUIDANCE",
+
+    # --- REACTOME: Autophagy & Mitophagy ---
+    "REACTOME_AUTOPHAGY",
+    "REACTOME_MACROAUTOPHAGY",
+    "REACTOME_SELECTIVE_AUTOPHAGY",
+    "REACTOME_CHAPERONE_MEDIATED_AUTOPHAGY",
+    "REACTOME_MITOPHAGY",
+    "REACTOME_PINK1_PRKN_MEDIATED_MITOPHAGY",
+
+    # --- REACTOME: GPCR / GNAQ / PLCb / PKC / Ca2+ Signaling (KISS1R-GnRH Axis) ---
+    "REACTOME_SIGNALING_BY_GPCR",
+    "REACTOME_GPCR_DOWNSTREAM_SIGNALLING",
+    "REACTOME_G_ALPHA_Q_SIGNALLING_EVENTS",
+    "REACTOME_PLC_BETA_MEDIATED_EVENTS",
+    "REACTOME_DAG_AND_IP3_SIGNALING",
+    "REACTOME_CA2_PATHWAY",
+
+    # --- REACTOME: MAPK / JNK, RTKs & Neurotrophins (MAPK8, SRC) ---
+    "REACTOME_MAPK_FAMILY_SIGNALING_CASCADES",
+    "REACTOME_JNK_C_JUN_KINASES_PHOSPHORYLATION_AND_ACTIVATION_MEDIATED_BY_ACTIVATED_HUMAN_TAK1",
+    "REACTOME_SIGNALING_BY_NTRKS",
+    "REACTOME_SIGNALING_BY_EGFR",
+    "REACTOME_SIGNALING_BY_ERBB2",
+    "REACTOME_SIGNALING_BY_VEGF",
+
+    # --- REACTOME: Cytoskeleton, Rho GTPases & Focal Adhesion (RAC1, ARHGEF25, SRC, PPP1CA) ---
+    "REACTOME_SIGNALING_BY_RHO_GTPASES",
+    "REACTOME_RHO_GTPASE_CYCLE",
+    "REACTOME_RAC1_GTPASE_CYCLE",
+    "REACTOME_RHO_GTPASE_EFFECTORS",
+    "REACTOME_NON_INTEGRIN_MEMBRANE_ECM_INTERACTIONS",
+
+    # --- REACTOME: Oxidative Stress, Apoptosis & Neuronal Cell Cycle (CDK5, RB1, E2F2, CREB1) ---
+    "REACTOME_CELLULAR_RESPONSE_TO_STRESS",
+    "REACTOME_CELLULAR_RESPONSE_TO_OXIDATIVE_STRESS",
+    "REACTOME_FOXO_MEDIATED_TRANSCRIPTION",
+    "REACTOME_APOPTOSIS",
+    "REACTOME_INTRINSIC_PATHWAY_FOR_APOPTOSIS",
+    "REACTOME_G1_S_SPECIFIC_TRANSCRIPTION",
+
+    # --- PROGENy Footprints ---
+    "MAPK", "EGFR", "PI3K", "VEGF", "TNFa", "NFkB", "WNT", "TGFb", "Hypoxia", "p53", "Trail"
+  ]
+
+  # Topological randomization parameters and statistical threshold
+  n_random_networks: 100
+  top_n_topology: 20
+  random_seed: 42
   fdr_threshold: 0.05

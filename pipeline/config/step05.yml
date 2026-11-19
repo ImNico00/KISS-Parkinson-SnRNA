@@ -1,13 +1,27 @@
 step05:
   organisms: "human"
-  omnipath_resources: ["ARN", "SIGNOR", "SignaLink3", "KEGG", "ACSN", "Reactome_SignaLink3", "Reactome_ProtMapper"]
+  omnipath_resources: [
+    "ARN",
+    "SIGNOR",
+    "SignaLink3",
+    "KEGG",
+    "ACSN",
+    "Reactome_SignaLink3",
+    "Reactome_ProtMapper"
+  ]
   omnipath_types: ["post_translational", "transcriptional"]
   perturbation_node: "KISS1R"
   target_states: [1, -1]
   top_tfs: 50
+  min_tfs_for_carnival: 5
+  # Options: "primary_nominal" (p < 0.05 on pre-specified primary consensus), "top_continuous", or "none"
+  fallback_tf_selection: "primary_nominal"
+  nominal_p_threshold: 0.05
+  diff_threshold: 0.20
+  weight_tfs_by_stability: true
   lambda_reg: 0.001
   solver: "scipy"
-  rel_gap: 0.005
+  rel_gap: 0.01
   solver_verbosity: 0
-  active_threshold: 0.00001
+  active_threshold: 1e-5
   max_workers: 3

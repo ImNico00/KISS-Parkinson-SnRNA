@@ -1,26 +1,26 @@
 step04:
-  min_cells_pseudobulk: 30
+  min_cells_pseudobulk: 20
   target_sum_norm: 10000.0
-  stratification_mode: "proxy" # oppure "proxy" con i proxy aggiornati sotto
+  stratification_mode: "proxy"
   kiss1r_gene: "KISS1R"
   gnaq_gene: "GNAQ"
   proxy_genes: [
-    # Accoppiamento Gq/11, chinasi recettoriale e beta-arrestine (Pampillo 2009; Szereszewski 2010; Babwah 2015)
     "GNA11", "GRK2", "ARRB1", "ARRB2",
-    # Fosfolipasi C-beta e Recettori IP3 del reticolo (Liu et al. 2008; Kotani et al. 2001)
     "PLCB1", "PLCB2", "PLCB3", "PLCB4",
     "ITPR1", "ITPR2", "ITPR3",
-    # Protein Chinasi C classiche (Liu et al. 2008)
     "PRKCA", "PRKCB",
-    # Canali TRPC co-espressi in scRT-PCR nei neuroni KISS1R+ (Zhang et al. 2008)
     "TRPC1", "TRPC3", "TRPC4", "TRPC5", "TRPC6", "TRPC7",
-    # Effettori MAPK a valle di Gq/PKC e beta-arrestina (Kotani 2001; Pampillo 2009; Szereszewski 2010)
     "MAPK1", "MAPK3", "MAPK14"
   ]
-  min_active_proxies: 22
+  min_active_proxies: 20
+  stability_proxy_thresholds: [18, 19, 20, 21]
   dorothea_levels: ["A", "B", "C"]
+  # Pre-specified primary consensus (use ["viper", "gsea", "mlm"], ["ulm", "mlm", "viper"], or ["all"])
+  primary_consensus_methods: ["viper", "gsea", "mlm"]
   decoupler_methods: ["ulm", "waggr", "viper", "aucell", "gsea", "gsva", "mlm", "zscore"]
+  run_stability_audit: true
   min_combo_size: 3
-  tmin_targets: 10
+  tmin_targets: 15
   fdr_threshold: 0.05
-  diff_threshold: 0.3
+  nominal_p_threshold: 0.05
+  diff_threshold: 0.25
